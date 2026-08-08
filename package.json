@@ -1,0 +1,11 @@
+{
+  "name": "sofa-prompt-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "沙发场景提示词工作台 — 统一进程管理",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "start": "node scripts/dev.mjs"
+  }
+}

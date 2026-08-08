@@ -1,0 +1,92 @@
+name: sofa-prompt-workbench
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+  env_file: .env
+  volumes:
+    - ./data/db:/data/db
+    - ./data/cache:/data/cache
+    - ./data/backups:/data/backups
+  networks: [internal]
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+  logging:
+    options: { max-size: 10m, max-file: "3" }
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: [redis-server, --appendonly, "yes", --maxmemory-policy, noeviction]
+    volumes: [redis-data:/data]
+    networks: [internal]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *backend
+    command: [alembic, -x, use_settings_url=true, upgrade, head]
+    restart: "no"
+
+  api:
+    <<: *backend
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    <<: *backend
+    command: [sh, -c, 'rq worker prompt-generation --name prompt-worker --url "$REDIS_URL"']
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  dispatcher:
+    <<: *backend
+    command: [python, -m, app.services.dispatcher]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  maintenance:
+    <<: *backend
+    command: [sh, -c, 'rq worker maintenance --name maintenance-worker --with-scheduler --url "$REDIS_URL"']
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports: ["8080:8080"]
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [internal]
+    read_only: true
+    tmpfs: [/var/cache/nginx:size=32m, /var/run:size=4m]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+
+networks:
+  internal:
+    driver: bridge
