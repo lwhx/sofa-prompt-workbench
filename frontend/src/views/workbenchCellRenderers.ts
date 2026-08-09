@@ -2,7 +2,7 @@
 import { h, type VNode } from 'vue'
 import type { ICellRendererParams } from 'ag-grid-community'
 import { ElButton } from 'element-plus'
-import { Delete, RefreshRight, View, WarningFilled } from '@element-plus/icons-vue'
+import { CircleClose, Delete, RefreshRight, View, WarningFilled } from '@element-plus/icons-vue'
 
 import type { RowItem } from '@/stores/rows'
 
@@ -40,6 +40,7 @@ export function collectCellLabels(node: unknown): string[] {
 
 type ActionHandlers = {
   runRow: (row: RowItem, force?: boolean) => Promise<unknown>
+  cancelRow: (row: RowItem) => Promise<void>
   openResults: (row: RowItem) => Promise<void>
   removeRow: (row: RowItem) => Promise<void>
   openErrorDetail: (row: RowItem) => void
@@ -69,6 +70,18 @@ export function buildActionCell(
         title: '重新运行',
         onClick: () => handlers.runRow(row, true),
       }, '重新运行'),
+    )
+  }
+  if (['QUEUED', 'ANALYZING', 'VALIDATING', 'REPAIRING', 'CANCELING'].includes(row.status)) {
+    buttons.push(
+      h(ElButton, {
+        size: 'small',
+        icon: CircleClose,
+        title: '取消任务',
+        type: 'warning',
+        disabled: row.status === 'CANCELING',
+        onClick: () => handlers.cancelRow(row),
+      }, row.status === 'CANCELING' ? '取消中' : '取消'),
     )
   }
   if (['NEEDS_REVIEW', 'COMPLETED'].includes(row.status)) {
@@ -106,4 +119,4 @@ export function buildActionCell(
   return h('div', { class: 'action-cell' }, buttons)
 }
 
-export { Delete, RefreshRight, View, WarningFilled }
+export { CircleClose, Delete, RefreshRight, View, WarningFilled }

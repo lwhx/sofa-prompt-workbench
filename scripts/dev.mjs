@@ -58,7 +58,7 @@ const SERVICES = [
     command: 'uv',
     args: ['run', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000'],
     cwd: 'backend',
-    env: {},
+    env: { HEALTH_REDIS_REQUIRED: 'false' },
     readyMarker: 'Application startup complete',
   },
   {
@@ -275,6 +275,7 @@ function shutdown() {
 const PROJECT_ROOT = resolve(process.cwd())
 const ENV_KEYS_TO_FORWARD = [
   'ONEIMG_BASE_URL', 'ONEIMG_API_TOKEN', 'ONEIMG_TIMEOUT_SECONDS',
+  'SSRF_ALLOW_PRIVATE_NETWORKS',
   'AI_PROVIDER', 'AI_BASE_URL', 'AI_CHAT_COMPLETIONS_PATH',
   'AI_API_KEY', 'AI_MODEL', 'AI_TIMEOUT_SECONDS',
 ]

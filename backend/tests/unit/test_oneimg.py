@@ -3,6 +3,7 @@ import pytest
 import respx
 
 from app.integrations.oneimg import OneImgClient, OneImgUploadError
+from app.security.outbound import OutboundURLValidationError
 
 
 @respx.mock
@@ -92,3 +93,18 @@ def test_http_200_business_failure_is_rejected(payload: dict[str, object]) -> No
         client.upload_image("sofa.png", b"bytes", "image/png")
 
     assert "secret-token" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "ftp://img.example.com",
+        "https://user:password@img.example.com",
+        "http://127.0.0.1",
+        "http://169.254.169.254",
+    ],
+)
+def test_client_rejects_unsafe_base_url(base_url: str) -> None:
+    """OneImg 客户端初始化时必须执行统一 SSRF 校验。"""
+    with pytest.raises(OutboundURLValidationError):
+        OneImgClient(base_url, "secret-token")

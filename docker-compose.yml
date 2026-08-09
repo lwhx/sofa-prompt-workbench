@@ -5,6 +5,8 @@ x-backend: &backend
     context: .
     dockerfile: backend/Dockerfile
   env_file: .env
+  environment:
+    TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.30.0.10/32}
   volumes:
     - ./data/db:/data/db
     - ./data/cache:/data/cache
@@ -24,7 +26,9 @@ services:
     image: redis:7.4-alpine
     command: [redis-server, --appendonly, "yes", --maxmemory-policy, noeviction]
     volumes: [redis-data:/data]
-    networks: [internal]
+    networks:
+      internal:
+        ipv4_address: 172.30.0.10
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     healthcheck:
@@ -65,10 +69,9 @@ services:
 
   maintenance:
     <<: *backend
-    command: [sh, -c, 'rq worker maintenance --name maintenance-worker --with-scheduler --url "$REDIS_URL"']
+    command: [python, -m, app.services.maintenance]
     depends_on:
       migrate: { condition: service_completed_successfully }
-      redis: { condition: service_healthy }
 
   web:
     build:
@@ -77,7 +80,9 @@ services:
     ports: ["8080:8080"]
     depends_on:
       api: { condition: service_healthy }
-    networks: [internal]
+    networks:
+      internal:
+        ipv4_address: 172.30.0.11
     read_only: true
     tmpfs: [/var/cache/nginx:size=32m, /var/run:size=4m]
     cap_drop: [ALL]
@@ -90,3 +95,6 @@ volumes:
 networks:
   internal:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

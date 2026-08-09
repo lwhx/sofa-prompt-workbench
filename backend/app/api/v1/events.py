@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-from collections.abc import AsyncIterator, Callable
-from time import monotonic
+from collections.abc import AsyncIterator
+from contextlib import suppress
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import Engine
 
 from app.dependencies import CurrentUser
-from app.models import Job, PromptResult, PromptRow
 
 router = APIRouter(tags=["实时事件"])
 
@@ -23,53 +20,59 @@ _INVALIDATE_EVENT = (
 )
 
 
-def _event_fingerprint(session: Session) -> str:
-    visible_rows = select(PromptRow.id).where(PromptRow.deleted_at.is_(None))
-    row_versions = session.execute(
-        select(PromptRow.id, PromptRow.row_revision, PromptRow.status)
-        .where(PromptRow.deleted_at.is_(None))
-        .order_by(PromptRow.id)
-    ).all()
-    job_versions = session.execute(
-        select(Job.id, Job.row_id, Job.status, Job.progress_percent)
-        .where(Job.row_id.in_(visible_rows))
-        .order_by(Job.id)
-    ).all()
-    result_versions = session.execute(
-        select(
-            PromptResult.id,
-            PromptResult.row_id,
-            PromptResult.version,
-            PromptResult.review_status,
-            PromptResult.is_stale,
-        )
-        .where(PromptResult.row_id.in_(visible_rows))
-        .order_by(PromptResult.id)
-    ).all()
-    payload = (row_versions, job_versions, result_versions)
-    return hashlib.sha256(repr(payload).encode()).hexdigest()
+class EventWatermarkHub:
+    def __init__(self, engine: Engine, *, poll_interval_seconds: float = _POLL_INTERVAL_SECONDS):
+        self._engine = engine
+        self._poll_interval_seconds = poll_interval_seconds
+        self._subscribers: set[asyncio.Queue[None]] = set()
+        self._task: asyncio.Task[None] | None = None
+
+    def subscribe(self) -> asyncio.Queue[None]:
+        queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+        self._subscribers.add(queue)
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._poll())
+        return queue
+
+    async def unsubscribe(self, queue: asyncio.Queue[None]) -> None:
+        self._subscribers.discard(queue)
+        if self._subscribers or self._task is None:
+            return
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+
+    async def _poll(self) -> None:
+        with self._engine.connect() as connection:
+            watermark = connection.exec_driver_sql("PRAGMA data_version").scalar_one()
+            while True:
+                await asyncio.sleep(self._poll_interval_seconds)
+                current_watermark = connection.exec_driver_sql("PRAGMA data_version").scalar_one()
+                if current_watermark == watermark:
+                    continue
+                watermark = current_watermark
+                for queue in tuple(self._subscribers):
+                    if queue.empty():
+                        queue.put_nowait(None)
 
 
-async def _events(*, once: bool, session_factory: Callable[[], Session]) -> AsyncIterator[str]:
+async def _events(*, once: bool, hub: EventWatermarkHub) -> AsyncIterator[str]:
     yield "retry: 3000\n"
     yield _INVALIDATE_EVENT
     if once:
         return
 
-    with session_factory() as session:
-        fingerprint = _event_fingerprint(session)
-    last_keepalive = monotonic()
-    while True:
-        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        with session_factory() as session:
-            current_fingerprint = _event_fingerprint(session)
-        if current_fingerprint != fingerprint:
-            fingerprint = current_fingerprint
-            yield _INVALIDATE_EVENT
-            continue
-        if monotonic() - last_keepalive >= _KEEPALIVE_INTERVAL_SECONDS:
-            last_keepalive = monotonic()
-            yield ": keepalive\n\n"
+    queue = hub.subscribe()
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_INTERVAL_SECONDS)
+                yield _INVALIDATE_EVENT
+            except TimeoutError:
+                yield ": keepalive\n\n"
+    finally:
+        await hub.unsubscribe(queue)
 
 
 @router.get("/events")
@@ -79,7 +82,7 @@ def events(
     once: bool = Query(default=False),
 ) -> StreamingResponse:
     return StreamingResponse(
-        _events(once=once, session_factory=request.app.state.session_factory),
+        _events(once=once, hub=request.app.state.event_watermark_hub),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",

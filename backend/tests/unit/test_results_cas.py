@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import create_database_engine
@@ -117,3 +119,73 @@ def test_validation_json_contains_review_and_warning_data(tmp_path: Path) -> Non
             "review_reasons": ["视角方向不确定"],
             "warnings": ["场景参考图局部遮挡"],
         }
+
+
+def test_terminal_cas_rejects_already_finished_job(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        row = PromptRow(
+            sort_key=10,
+            row_revision=1,
+            input_fingerprint="current",
+            status=RowStatus.CANCELED,
+        )
+        session.add(row)
+        session.commit()
+        job = make_job(session, row, revision=1, fingerprint="current")
+        job.status = JobStatus.CANCELED
+        session.commit()
+
+        with pytest.raises(RuntimeError, match="JOB_TERMINAL_CAS_CONFLICT"):
+            finalize_result_with_row_cas(
+                session,
+                job_id=job.id,
+                payload={"positive_prompt": "不应保存", "negative_prompt": "镜像"},
+                source="ai",
+                review_required=False,
+            )
+
+        assert session.scalar(
+            select(PromptResult).where(PromptResult.job_id == job.id)
+        ) is None
+
+
+def test_terminal_cas_rejects_concurrent_cancel_request(tmp_path: Path) -> None:
+    database_path = tmp_path / "cancel-race.db"
+    engine = create_database_engine(f"sqlite:///{database_path}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as setup_session:
+        row = PromptRow(
+            sort_key=10,
+            row_revision=1,
+            input_fingerprint="current",
+            status=RowStatus.CANCELING,
+        )
+        setup_session.add(row)
+        setup_session.commit()
+        job = make_job(setup_session, row, revision=1, fingerprint="current")
+        row.active_job_id = job.id
+        setup_session.commit()
+        job_id = job.id
+
+    with Session(engine) as worker_session, Session(engine) as cancel_session:
+        worker_session.get(Job, job_id)
+        cancel_job = cancel_session.get(Job, job_id)
+        assert cancel_job is not None
+        cancel_job.status = JobStatus.CANCEL_REQUESTED
+        cancel_job.cancel_requested = True
+        cancel_session.commit()
+
+        with pytest.raises(RuntimeError, match="JOB_TERMINAL_CAS_CONFLICT"):
+            finalize_result_with_row_cas(
+                worker_session,
+                job_id=job_id,
+                payload={"positive_prompt": "不得覆盖取消", "negative_prompt": "镜像"},
+                source="ai",
+                review_required=False,
+            )
+
+    with Session(engine) as verification_session:
+        assert verification_session.get(Job, job_id).status == JobStatus.CANCEL_REQUESTED  # type: ignore[union-attr]
+        assert verification_session.scalar(
+            select(PromptResult).where(PromptResult.job_id == job_id)
+        ) is None

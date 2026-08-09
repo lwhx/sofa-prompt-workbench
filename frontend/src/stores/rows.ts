@@ -9,9 +9,12 @@ export interface RowItem {
   row_revision: number
   /** 该任务行的反推提示词结果数量 */
   results_count: number
+  selected_result_id?: string | null
   sort_key: number
   auto_run: boolean
   created_at: string | null
+  /** 软删除时间，非空时表示任务位于回收站。 */
+  deleted_at?: string | null
   error_message?: string | null
   /** 最近一次任务开始时间（ISO 字符串）。 */
   job_started_at?: string | null
@@ -21,6 +24,16 @@ export interface RowItem {
   sofa_asset_id?: string | null
   scene_asset?: AssetSummary | null
   sofa_asset?: AssetSummary | null
+}
+
+/** 任务行列表与导出的服务端筛选条件。 */
+export interface RowFilters {
+  /** 按任务名称或任务 ID 模糊搜索。 */
+  search?: string
+  /** 按任务状态筛选。 */
+  status?: string[]
+  /** 是否仅查询软删除任务。 */
+  onlyDeleted?: boolean
 }
 
 export interface AssetSummary {
@@ -52,6 +65,7 @@ export interface PromptResultItem {
   negative_prompt: string
   review_status: string
   review: { required?: boolean; reasons?: string[] }
+  sofa_view?: { view_type?: string; near_end?: string; far_end?: string }
   warnings: string[]
   is_stale: boolean
   created_at?: string | null
@@ -63,6 +77,8 @@ export interface PromptResultItem {
 export const useRowsStore = defineStore('rows', () => {
   const rows = ref<RowItem[]>([])
   const loading = ref(false)
+  /** 当前任务行筛选条件。 */
+  const filters = ref<RowFilters>({})
   /** 正在执行整行写操作（运行/删除等）的任务行 ID 集合。 */
   const mutatingRowIds = ref<Set<string>>(new Set())
   /** 正在执行单元格写操作（上传/解绑图片等）的 key 集合，格式 `${rowId}:${kind}`。 */
@@ -70,6 +86,8 @@ export const useRowsStore = defineStore('rows', () => {
   /** 是否有任意行正在执行写操作。 */
   const mutating = computed(() => mutatingRowIds.value.size > 0 || mutatingCellKeys.value.size > 0)
   const rowMutations = new Map<string, Promise<void>>()
+  /** 最近一次任务行列表请求的递增序号。 */
+  let rowsRequestId = 0
 
   /**
    * 判断指定行（或其某个图片格子）是否正在执行写操作。
@@ -88,13 +106,34 @@ export const useRowsStore = defineStore('rows', () => {
     return false
   }
 
-  async function fetchRows() {
+  /**
+   * 转换当前筛选条件为后端查询参数。
+   * @param source - 要转换的筛选条件。
+   * @returns 可直接传给 axios 的查询参数。
+   */
+  function buildFilterParams(source: RowFilters = filters.value): Record<string, string | string[] | boolean> {
+    const params: Record<string, string | string[] | boolean> = {}
+    const search = source.search?.trim()
+    if (search) params.search = search
+    if (source.status?.length) params.status = source.status
+    if (source.onlyDeleted) params.only_deleted = true
+    return params
+  }
+
+  /**
+   * 拉取当前筛选条件下的任务行。
+   * @param nextFilters - 可选的新筛选条件，传入后同步替换当前条件。
+   * @returns 请求完成的 Promise。
+   */
+  async function fetchRows(nextFilters?: RowFilters): Promise<void> {
+    if (nextFilters) filters.value = { ...nextFilters }
+    const requestId = ++rowsRequestId
     loading.value = true
     try {
-      const res = await api.get('/api/v1/rows')
-      rows.value = res.data?.data ?? []
+      const res = await api.get('/api/v1/rows', { params: buildFilterParams() })
+      if (requestId === rowsRequestId) rows.value = res.data?.data ?? []
     } finally {
-      loading.value = false
+      if (requestId === rowsRequestId) loading.value = false
     }
   }
 
@@ -108,9 +147,8 @@ export const useRowsStore = defineStore('rows', () => {
   }
 
   async function getLatestRow(rowId: string): Promise<RowItem> {
-    const response = await api.get('/api/v1/rows')
+    const response = await api.get('/api/v1/rows', { params: { include_deleted: true } })
     const latestRows = (response.data?.data ?? []) as RowItem[]
-    rows.value = latestRows
     const latest = latestRows.find(item => item.id === rowId)
     if (!latest) throw new Error('任务行不存在或已删除')
     return latest
@@ -151,9 +189,9 @@ export const useRowsStore = defineStore('rows', () => {
       }
     })
     rowMutations.set(rowId, mutation)
-    mutation.finally(() => {
+    void mutation.finally(() => {
       if (rowMutations.get(rowId) === mutation) rowMutations.delete(rowId)
-    })
+    }).catch(() => undefined)
     return mutation
   }
 
@@ -174,10 +212,15 @@ export const useRowsStore = defineStore('rows', () => {
         throw error
       }
       const field = kind === 'scene_reference' ? 'scene_asset_id' : 'sofa_asset_id'
-      await api.patch(`/api/v1/rows/${row.id}`, {
-        expected_revision: latest.row_revision,
-        [field]: assetId,
-      })
+      try {
+        await api.patch(`/api/v1/rows/${row.id}`, {
+          expected_revision: latest.row_revision,
+          [field]: assetId,
+        })
+      } catch (error) {
+        try { await api.delete(`/api/v1/assets/${assetId}`) } catch { /* 资产可能已被其他流程清理 */ }
+        throw error
+      }
       await fetchRows()
     }, kind)
   }
@@ -193,6 +236,16 @@ export const useRowsStore = defineStore('rows', () => {
     })
   }
 
+  async function cancelRow(row: RowItem) {
+    return enqueueMutation(row.id, async () => {
+      const latest = await getLatestRow(row.id)
+      await api.post(`/api/v1/rows/${row.id}/cancel`, {
+        expected_revision: latest.row_revision,
+      })
+      await fetchRows()
+    })
+  }
+
   async function deleteRow(row: RowItem) {
     return enqueueMutation(row.id, async () => {
       const latest = await getLatestRow(row.id)
@@ -201,6 +254,43 @@ export const useRowsStore = defineStore('rows', () => {
       })
       await fetchRows()
     })
+  }
+
+  /**
+   * 恢复回收站中的软删除任务行。
+   * @param row - 要恢复的任务行。
+   * @returns 恢复完成的 Promise。
+   */
+  async function restoreRow(row: RowItem): Promise<void> {
+    return enqueueMutation(row.id, async () => {
+      await api.post(`/api/v1/rows/${row.id}/restore`, undefined, {
+        params: { expected_revision: row.row_revision },
+      })
+      await fetchRows()
+    })
+  }
+
+  /**
+   * 导出当前筛选结果并触发浏览器下载。
+   * @param format - 导出格式。
+   * @returns 下载完成的 Promise。
+   */
+  async function exportRows(format: 'json' | 'csv'): Promise<void> {
+    const response = await api.get('/api/v1/rows/export', {
+      params: { ...buildFilterParams(), format },
+      responseType: 'blob',
+    })
+    const contentDisposition = String(response.headers?.['content-disposition'] ?? '')
+    const encodedName = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
+    const filename = encodedName ? decodeURIComponent(encodedName) : `任务数据.${format}`
+    const downloadUrl = URL.createObjectURL(response.data as Blob)
+    const anchor = document.createElement('a')
+    anchor.href = downloadUrl
+    anchor.download = filename
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    URL.revokeObjectURL(downloadUrl)
   }
 
   async function detachAsset(row: RowItem, kind: 'scene_reference' | 'sofa_product') {
@@ -245,8 +335,9 @@ export const useRowsStore = defineStore('rows', () => {
   }
 
   return {
-    rows, loading, mutating, mutatingRowIds, mutatingCellKeys, isMutating,
+    rows, loading, filters, mutating, mutatingRowIds, mutatingCellKeys, isMutating,
     fetchRows, createRow, uploadAndAttach, detachAsset,
-    runRow, deleteRow, fetchResults, fetchAssets, attachExistingAsset,
+    runRow, cancelRow, deleteRow, restoreRow, exportRows,
+    fetchResults, fetchAssets, attachExistingAsset,
   }
 })

@@ -199,7 +199,36 @@
             </el-descriptions-item>
           </el-descriptions>
 
+          <div
+            v-if="capability.configured && !editingCapability"
+            class="capability-actions"
+          >
+            <el-button
+              :icon="Edit"
+              @click="editingCapability = true"
+            >
+              修改配置
+            </el-button>
+            <el-button
+              :icon="Connection"
+              :loading="testingCapability"
+              @click="testCapability"
+            >
+              测试连接
+            </el-button>
+            <el-button
+              type="danger"
+              plain
+              :icon="Delete"
+              :loading="deletingCapability"
+              @click="deleteCapability"
+            >
+              删除配置
+            </el-button>
+          </div>
+
           <el-form
+            v-if="editingCapability || !capability.configured"
             class="edit-panel capability-form"
             label-position="top"
             @submit.prevent="saveCapability"
@@ -266,6 +295,12 @@
               配置将加密保存，API Key 不会回显。保存后对新运行的任务立即生效，无需重启服务。
             </p>
             <div class="panel-actions">
+              <el-button
+                v-if="capability.configured"
+                @click="cancelCapabilityEdit"
+              >
+                取消修改
+              </el-button>
               <el-button
                 :icon="Connection"
                 :loading="testingCapability"
@@ -347,8 +382,8 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Connection, Plus, Refresh } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { Connection, Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { TabsPaneContext } from 'element-plus'
 import { api, extractApiError } from '@/services/api'
 
@@ -445,6 +480,10 @@ const activatingTemplateId = ref('')
 const testingCapability = ref(false)
 /** 保存 AI 能力状态。 */
 const savingCapability = ref(false)
+/** 删除 AI 能力配置状态。 */
+const deletingCapability = ref(false)
+/** 是否正在编辑 AI 能力配置。 */
+const editingCapability = ref(false)
 /** 模板创建区域是否显示。 */
 const templateFormVisible = ref(false)
 /** 模板创建表单。 */
@@ -611,6 +650,7 @@ async function fetchCapability(): Promise<void> {
       chatPath: capability.chat_path || '/chat/completions',
       timeoutSeconds: capability.timeout_seconds || 240,
     })
+    editingCapability.value = !capability.configured
   } catch (reason: unknown) {
     ElMessage.error(errorMessage(reason, 'AI 能力加载失败'))
   } finally {
@@ -652,13 +692,56 @@ async function saveCapability(): Promise<void> {
 async function testCapability(): Promise<void> {
   testingCapability.value = true
   try {
-    await api.post('/api/v1/admin/ai-capability/test')
-    ElMessage.success('AI 能力测试已完成')
+    const response = await api.post('/api/v1/admin/ai-capability/test')
+    const result = unwrapData<{ status?: string; details?: { http_status?: number } }>(response.data)
+    if (result.status !== 'AVAILABLE') {
+      const statusText = result.details?.http_status ? `HTTP ${result.details.http_status}` : '服务不可用'
+      ElMessage.error(`AI 连接测试失败：${statusText}`)
+      await fetchCapability()
+      return
+    }
+    ElMessage.success('AI 连接测试成功')
     await fetchCapability()
   } catch (reason: unknown) {
     ElMessage.error(errorMessage(reason, 'AI 能力测试失败'))
   } finally {
     testingCapability.value = false
+  }
+}
+
+/** 取消修改并恢复当前已保存配置。 */
+function cancelCapabilityEdit(): void {
+  editingCapability.value = false
+  Object.assign(capabilityForm, {
+    provider: capability.provider || 'openai-compatible',
+    baseUrl: capability.base_url || '',
+    apiKey: '',
+    model: capability.model || '',
+    chatPath: capability.chat_path || '/chat/completions',
+    timeoutSeconds: capability.timeout_seconds || 240,
+  })
+}
+
+/** 删除当前 AI 能力配置。 */
+async function deleteCapability(): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      '删除后将立即停止使用当前 AI 配置，且无法恢复。确定继续吗？',
+      '删除 AI 配置',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  deletingCapability.value = true
+  try {
+    await api.delete('/api/v1/admin/ai-capability')
+    ElMessage.success('AI 配置已删除')
+    await fetchCapability()
+  } catch (reason: unknown) {
+    ElMessage.error(errorMessage(reason, 'AI 配置删除失败'))
+  } finally {
+    deletingCapability.value = false
   }
 }
 
@@ -792,6 +875,13 @@ onMounted(fetchTemplates)
 .capability-form {
   margin-top: 16px;
   margin-bottom: 0;
+}
+
+.capability-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
 }
 
 .config-note {

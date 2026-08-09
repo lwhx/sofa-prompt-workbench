@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.domain.ai_schema import normalize_provider_payload
@@ -37,11 +37,7 @@ def finalize_result_with_row_cas(
         )
         or 0
     ) + 1
-    is_stale = (
-        row.row_revision != job.row_revision
-        or row.input_fingerprint != job.input_fingerprint
-        or row.deleted_at is not None
-    )
+    is_stale = False
     payload_json = normalized.model_dump_json()
     validation = {
         "passed": not review_required and not normalized.review.required,
@@ -78,18 +74,50 @@ def finalize_result_with_row_cas(
     session.add(result)
     session.flush()
 
-    job.status = JobStatus.REVIEW_REQUIRED if review_required else JobStatus.SUCCEEDED
-    job.completed_at = datetime.now(UTC)
-    if row.active_job_id == job.id:
-        row.active_job_id = None
-    if not is_stale:
-        row.latest_result_id = result.id
-        if row.selected_result_id is None:
-            row.selected_result_id = result.id
-            result.selected_at = result.created_at
-        row.last_success_fingerprint = job.input_fingerprint
-        row.status = RowStatus.NEEDS_REVIEW if review_required else RowStatus.COMPLETED
-        row.dirty = False
+    terminal_status = JobStatus.REVIEW_REQUIRED if review_required else JobStatus.SUCCEEDED
+    completed_at = datetime.now(UTC)
+    finalized_job = session.execute(
+        update(Job)
+        .where(
+            Job.id == job.id,
+            Job.status.in_(
+                (
+                    JobStatus.RUNNING,
+                    JobStatus.VALIDATING,
+                    JobStatus.REPAIRING,
+                )
+            ),
+        )
+        .values(status=terminal_status, completed_at=completed_at)
+        .execution_options(synchronize_session=False)
+    )
+    if getattr(finalized_job, "rowcount", 0) != 1:
+        session.rollback()
+        raise RuntimeError("JOB_TERMINAL_CAS_CONFLICT")
+    selected_result_id = row.selected_result_id or result.id
+    updated_row = session.execute(
+        update(PromptRow)
+        .where(
+            PromptRow.id == row.id,
+            PromptRow.row_revision == job.row_revision,
+            PromptRow.input_fingerprint == job.input_fingerprint,
+            PromptRow.active_job_id == job.id,
+            PromptRow.deleted_at.is_(None),
+        )
+        .values(
+            active_job_id=None,
+            latest_result_id=result.id,
+            selected_result_id=selected_result_id,
+            last_success_fingerprint=job.input_fingerprint,
+            status=RowStatus.NEEDS_REVIEW if review_required else RowStatus.COMPLETED,
+            dirty=False,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    is_stale = getattr(updated_row, "rowcount", 0) != 1
+    result.is_stale = is_stale
+    if not is_stale and row.selected_result_id is None:
+        result.selected_at = result.created_at
     session.commit()
     session.refresh(result)
     return result

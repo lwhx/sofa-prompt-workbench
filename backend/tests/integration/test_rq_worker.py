@@ -14,7 +14,7 @@ from app.database import create_database_engine
 from app.enums import JobStatus
 from app.models import Base, Job, JobAttempt, PromptResult, PromptRow
 from app.services.dispatch import create_job_and_outbox, dispatch_pending_outbox
-from app.services.worker import load_skill_prompts
+from app.services.worker import load_skill_prompts, resolve_job_prompts
 
 
 def test_outbox_enqueues_to_rq_via_fakeredis(tmp_path: Path) -> None:
@@ -174,6 +174,50 @@ def test_worker_recovers_from_unexpected_exception(tmp_path: Path, monkeypatch) 
         assert "规则文件损坏" not in (attempt.error_message or "")
 
 
+def test_worker_recovery_preserves_concurrent_cancel(tmp_path: Path) -> None:
+    from app.services.worker import _recover_failed_attempt
+
+    db_url = f"sqlite:///{tmp_path / 'cancel-recovery.db'}"
+    engine = create_database_engine(db_url)
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        row = PromptRow(sort_key=10, name="取消恢复", row_revision=1, input_fingerprint="fp-cancel")
+        session.add(row)
+        session.flush()
+        job = Job(
+            row_id=row.id,
+            status=JobStatus.CANCEL_REQUESTED,
+            cancel_requested=True,
+            row_revision=1,
+            input_fingerprint="fp-cancel",
+            input_snapshot_json="{}",
+        )
+        session.add(job)
+        session.flush()
+        row.active_job_id = job.id
+        attempt = JobAttempt(job_id=job.id, attempt_no=1, kind="ai", status="SUCCEEDED")
+        session.add(attempt)
+        session.commit()
+
+        _recover_failed_attempt(
+            session,
+            job_id=job.id,
+            attempt_id=attempt.id,
+            started=0.0,
+            code="WORKER_ERROR",
+            message="任务执行发生内部错误",
+        )
+
+        session.refresh(job)
+        session.refresh(row)
+        session.refresh(attempt)
+        assert job.status == JobStatus.CANCELED
+        assert row.active_job_id is None
+        assert attempt.status == "CANCELED"
+        assert attempt.error_code is None
+
+
 def test_worker_recovers_when_snapshot_is_invalid(tmp_path: Path) -> None:
     from app.services import worker
 
@@ -296,3 +340,63 @@ def test_worker_prompt_requires_ai_to_infer_sofa_direction() -> None:
     assert "以白底产品图作为唯一产品依据" in prompt
     assert "sofa_view" in user_prompt
     assert "positive_prompt" in user_prompt
+
+
+def test_job_snapshot_options_are_injected_into_user_prompt(tmp_path: Path) -> None:
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'prompt-options.db'}")
+    Base.metadata.create_all(engine)
+    snapshot = {
+        "row_options": {
+            "custom_requirements": "保留落地灯并使用暖光",
+            "include_person": True,
+            "view_override": {
+                "view_type": "right_front_three_quarter",
+                "near_end": "右端",
+                "far_end": "左端",
+            },
+        }
+    }
+
+    with Session(engine) as session:
+        _, user_prompt = resolve_job_prompts(session, snapshot)
+
+    assert "【附加要求】保留落地灯并使用暖光" in user_prompt
+    assert "【包含人物】是" in user_prompt
+    assert '"view_type": "right_front_three_quarter"' in user_prompt
+    assert "人工方位覆盖的优先级高于模型判断，不得更改" in user_prompt
+
+
+def test_worker_prompt_uses_frozen_template_instead_of_current_active_template(
+    tmp_path: Path,
+) -> None:
+    from app.models import PromptTemplate
+
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'frozen-template.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(
+            PromptTemplate(
+                name="当前模板",
+                version=2,
+                system_prompt="当前系统提示词",
+                user_prompt_template="当前用户提示词",
+                output_schema_json="{}",
+                content_hash="current-hash",
+                is_active=True,
+            )
+        )
+        session.commit()
+        system_prompt, user_prompt = resolve_job_prompts(
+            session,
+            {
+                "template": {
+                    "system_prompt": "冻结系统提示词",
+                    "user_prompt_template": "冻结用户提示词",
+                },
+                "row_options": {},
+            },
+        )
+
+    assert system_prompt == "冻结系统提示词"
+    assert user_prompt.startswith("冻结用户提示词")
+    assert "当前用户提示词" not in user_prompt

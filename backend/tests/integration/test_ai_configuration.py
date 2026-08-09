@@ -119,12 +119,67 @@ def test_blank_api_key_keeps_existing_secret(tmp_path: Path) -> None:
     assert configuration.model == "new-vision-model"
 
 
+def test_delete_ai_configuration_disables_environment_fallback(tmp_path: Path) -> None:
+    """删除数据库配置后不得重新暴露或启用环境变量回退配置。"""
+    client, engine, settings = make_client(tmp_path)
+    settings.ai_base_url = "https://environment.example.com/v1"
+    settings.ai_api_key = "environment-secret-key"
+    settings.ai_model = "environment-model"
+    headers = login(client)
+    assert client.put(
+        "/api/v1/admin/ai-capability",
+        json=configuration_payload("database-secret-key"),
+        headers=headers,
+    ).status_code == 200
+
+    response = client.delete("/api/v1/admin/ai-capability", headers=headers)
+    query_response = client.get("/api/v1/admin/ai-capability")
+
+    assert response.status_code == 200
+    assert query_response.status_code == 200
+    assert query_response.json()["data"]["configured"] is False
+    assert query_response.json()["data"]["api_key_configured"] is False
+    assert query_response.json()["data"]["base_url"] is None
+    with Session(engine) as session:
+        configuration = load_ai_configuration(session, settings)
+        audit = session.query(AuditEvent).filter_by(event_type="AI_CONFIGURATION_DELETED").one()
+    assert configuration.configured is False
+    assert configuration.source == "database"
+    assert "environment-secret-key" not in audit.details_json
+
+
 def test_ai_configuration_rejects_credentialed_url(tmp_path: Path) -> None:
     """Base URL 不得携带可能泄露的用户名或密码。"""
     client, _engine, _settings = make_client(tmp_path)
     headers = login(client)
     payload = configuration_payload("secret-key")
     payload["base_url"] = "https://user:password@api.example.com/v1"
+
+    response = client.put(
+        "/api/v1/admin/ai-capability",
+        json=payload,
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "AI_CONFIGURATION_INVALID"
+
+
+def test_ai_configuration_rejects_private_dns_result(tmp_path: Path, monkeypatch) -> None:
+    """AI Base URL 解析到私网地址时必须拒绝保存。"""
+    import socket
+
+    client, _engine, _settings = make_client(tmp_path)
+    headers = login(client)
+    payload = configuration_payload("secret-key")
+    payload["base_url"] = "https://internal.example.net/v1"
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.10.0.5", 443))
+        ],
+    )
 
     response = client.put(
         "/api/v1/admin/ai-capability",

@@ -2,24 +2,25 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
 
 from redis import Redis
 from rq import Queue
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import create_database_engine
-from app.services.dispatch import dispatch_pending_outbox
+from app.services.auto_run import consume_due_auto_run_intents
+from app.services.dispatch import dispatch_pending_outbox, recover_lost_queued_jobs
 from app.services.worker import reap_stale_jobs, run_prompt_job
 
 logger = logging.getLogger(__name__)
 
-_engine: Any = None
-_redis: Any = None
+_engine: Engine | None = None
+_redis: Redis | None = None
 
 
-def _get_engine():
+def _get_engine() -> Engine:
     """获取数据库引擎单例。连接异常时自动重建。"""
     global _engine
     if _engine is None:
@@ -27,7 +28,7 @@ def _get_engine():
     return _engine
 
 
-def _get_redis():
+def _get_redis() -> Redis:
     """获取 Redis 连接单例。连接异常时自动重建。"""
     global _redis
     if _redis is None:
@@ -52,6 +53,20 @@ def dispatch_once() -> int:
     engine = _get_engine()
     connection = None if settings.local_inline_worker else _get_redis()
 
+    def queue_contains(job_id: str, queue_name: str) -> bool:
+        if settings.local_inline_worker:
+            return True
+        queue = Queue(queue_name, connection=connection)
+        existing = queue.fetch_job(job_id)
+        if existing is None:
+            return False
+        return existing.get_status(refresh=True) in {
+            "queued",
+            "started",
+            "deferred",
+            "scheduled",
+        }
+
     def enqueue(job_id: str, queue_name: str) -> None:
         if settings.local_inline_worker:
             run_prompt_job(job_id)
@@ -74,6 +89,8 @@ def dispatch_once() -> int:
         )
 
     with Session(engine) as session:
+        consume_due_auto_run_intents(session, settings=settings)
+        recover_lost_queued_jobs(session, queue_contains=queue_contains)
         dispatched = dispatch_pending_outbox(session, enqueue=enqueue)
         reap_stale_jobs(session)
         return dispatched

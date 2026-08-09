@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from urllib.parse import urljoin
 import httpx
 
 from app.domain.ai_schema import PromptResultPayload, normalize_provider_payload
+from app.security.outbound import request_outbound, validate_outbound_url
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +18,31 @@ logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 2.0
+_RESPONSE_WRAPPER_KEYS = ("data", "result", "output", "response", "config")
 
 
 class AIProviderError(RuntimeError):
     pass
+
+
+def _has_required_prompts(payload: dict[str, Any]) -> bool:
+    current = payload
+    for _ in range(len(_RESPONSE_WRAPPER_KEYS)):
+        wrapped = next(
+            (
+                current[key]
+                for key in _RESPONSE_WRAPPER_KEYS
+                if isinstance(current.get(key), dict)
+            ),
+            None,
+        )
+        if wrapped is None:
+            break
+        current = wrapped
+    return all(
+        isinstance(current.get(key), str) and bool(current[key].strip())
+        for key in ("positive_prompt", "negative_prompt")
+    )
 
 
 @dataclass(frozen=True)
@@ -42,8 +65,13 @@ class OpenAICompatibleProvider:
         model: str,
         chat_path: str = "chat/completions",
         timeout_seconds: float = 240,
+        allow_private_networks: bool = False,
     ) -> None:
-        self.endpoint = urljoin(base_url.rstrip("/") + "/", chat_path.lstrip("/"))
+        self.allow_private_networks = allow_private_networks
+        self.endpoint = validate_outbound_url(
+            urljoin(base_url.rstrip("/") + "/", chat_path.lstrip("/")),
+            allow_private_networks=allow_private_networks,
+        )
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
@@ -80,16 +108,23 @@ class OpenAICompatibleProvider:
         choice = choices[0]
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
         content = message.get("content", "") if isinstance(message, dict) else ""
-        parsed = normalize_provider_payload(content)
-        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
-        request_id = payload.get("id") if isinstance(payload.get("id"), str) else None
         finish_reason = choice.get("finish_reason")
         finish_reason = finish_reason if isinstance(finish_reason, str) else None
         if finish_reason == "length":
-            logger.warning(
-                "视觉模型输出被截断 (finish_reason=length)，"
-                "positive_prompt 可能不完整，建议提高 max_tokens 或缩减分析字段"
-            )
+            raise AIProviderError("视觉模型输出被截断 (finish_reason=length)")
+        if not isinstance(content, str) or not content.strip():
+            raise AIProviderError("视觉模型返回内容为空")
+        try:
+            content_payload = json.loads(content)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise AIProviderError("视觉模型返回内容不是有效 JSON") from exc
+        if not isinstance(content_payload, dict):
+            raise AIProviderError("视觉模型返回 JSON 必须是对象")
+        if not _has_required_prompts(content_payload):
+            raise AIProviderError("视觉模型返回结果缺少必需的正向或负向提示词")
+        parsed = normalize_provider_payload(content_payload)
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        request_id = payload.get("id") if isinstance(payload.get("id"), str) else None
         prompt_tokens = usage.get("prompt_tokens")
         prompt_tokens = prompt_tokens if isinstance(prompt_tokens, int) else None
         completion_tokens = usage.get("completion_tokens")
@@ -123,8 +158,10 @@ class OpenAICompatibleProvider:
         last_status: int | None = None
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                response = httpx.post(
+                response = request_outbound(
+                    "POST",
                     self.endpoint,
+                    allow_private_networks=self.allow_private_networks,
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json=request_body,
                     timeout=self.timeout_seconds,
@@ -144,7 +181,10 @@ class OpenAICompatibleProvider:
                     raise AIProviderError(
                         f"视觉模型请求失败 (HTTP {response.status_code}): {detail}"
                     )
-                return response.json()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise AIProviderError("视觉模型响应必须是 JSON 对象")
+                return payload
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 if attempt < _MAX_RETRIES:
                     delay = _RETRY_BASE_DELAY * (2 ** attempt)

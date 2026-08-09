@@ -22,10 +22,16 @@ jobs:
         run: uv python install 3.12
       - name: 安装后端依赖
         run: uv sync --locked --extra dev
+      - name: 检查后端锁文件
+        run: uv lock --check
       - name: 运行后端代码检查
         run: uv run ruff check app tests
+      - name: 运行后端类型检查
+        run: uv run mypy app
+      - name: 验证数据库迁移
+        run: uv run pytest tests/integration/test_migrations.py -q
       - name: 运行后端测试
-        run: uv run pytest
+        run: uv run pytest -q
 
   frontend:
     name: 前端检查

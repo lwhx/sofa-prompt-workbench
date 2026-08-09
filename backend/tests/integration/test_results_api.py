@@ -8,7 +8,7 @@ from app.config import Settings
 from app.database import create_database_engine
 from app.enums import RowStatus
 from app.main import create_app
-from app.models import AdminUser, Base, PromptResult, PromptRow
+from app.models import AdminUser, Asset, AuditEvent, AutoRunIntent, Base, PromptResult, PromptRow
 from app.security.password import hash_password
 
 
@@ -86,9 +86,12 @@ def test_select_result_uses_revision_cas(tmp_path: Path) -> None:
         assert saved is not None
         assert saved.selected_result_id == result.id
         assert saved.row_revision == 2
+        audit = session.query(AuditEvent).filter_by(event_type="RESULT_SELECTED").one()
+        assert audit.row_id == row.id
+        assert json.loads(audit.details_json)["result_id"] == result.id
 
 
-def test_delete_selected_result_promotes_latest_remaining_version(tmp_path: Path) -> None:
+def test_delete_selected_result_is_protected(tmp_path: Path) -> None:
     client, engine, row, selected = make_client(tmp_path)
     with Session(engine) as session:  # type: ignore[arg-type]
         saved_row = session.get(PromptRow, row.id)
@@ -110,21 +113,23 @@ def test_delete_selected_result_promotes_latest_remaining_version(tmp_path: Path
 
     response = client.delete(f"/api/v1/rows/{row.id}/results/{selected.id}")
 
-    assert response.status_code == 200
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "SELECTED_RESULT_PROTECTED"
     with Session(engine) as session:  # type: ignore[arg-type]
         saved_row = session.get(PromptRow, row.id)
         assert saved_row is not None
-        assert session.get(PromptResult, selected.id) is None
-        assert saved_row.selected_result_id == remaining_id
-        assert saved_row.latest_result_id == remaining_id
+        saved_result = session.get(PromptResult, selected.id)
+        assert saved_result is not None
+        assert saved_result.hidden_at is None
+        assert saved_row.selected_result_id == selected.id
+        assert remaining_id is not None
 
 
-def test_delete_only_result_clears_result_references(tmp_path: Path) -> None:
+def test_delete_result_soft_hides_and_filters_it_from_history(tmp_path: Path) -> None:
     client, engine, row, result = make_client(tmp_path)
     with Session(engine) as session:  # type: ignore[arg-type]
         saved_row = session.get(PromptRow, row.id)
         assert saved_row is not None
-        saved_row.selected_result_id = result.id
         saved_row.latest_result_id = result.id
         session.commit()
 
@@ -134,8 +139,12 @@ def test_delete_only_result_clears_result_references(tmp_path: Path) -> None:
     with Session(engine) as session:  # type: ignore[arg-type]
         saved_row = session.get(PromptRow, row.id)
         assert saved_row is not None
-        assert saved_row.selected_result_id is None
+        saved_result = session.get(PromptResult, result.id)
+        assert saved_result is not None
+        assert saved_result.hidden_at is not None
         assert saved_row.latest_result_id is None
+    listed = client.get(f"/api/v1/rows/{row.id}/results")
+    assert listed.json()["data"] == []
 
 
 def test_confirm_review_saves_override_and_returns_row_ready_for_successor_job(
@@ -147,6 +156,7 @@ def test_confirm_review_saves_override_and_returns_row_ready_for_successor_job(
         f"/api/v1/rows/{row.id}/review/confirm",
         json={
             "expected_revision": 1,
+            "result_id": _result.id,
             "view_override": {
                 "view_type": "right_front_three_quarter",
                 "near_end": "右侧",
@@ -157,9 +167,62 @@ def test_confirm_review_saves_override_and_returns_row_ready_for_successor_job(
     )
 
     assert response.status_code == 200
+    assert response.json()["data"]["status"] == "READY"
     with Session(engine) as session:  # type: ignore[arg-type]
         saved = session.get(PromptRow, row.id)
         assert saved is not None
         assert saved.view_override_enabled is True
         assert saved.status == RowStatus.READY
         assert saved.row_revision == 2
+        saved_result = session.get(PromptResult, _result.id)
+        assert saved_result is not None
+        assert saved_result.review_status == "CONFIRMED"
+        audit = session.query(AuditEvent).filter_by(event_type="REVIEW_CONFIRMED").one()
+        assert audit.row_id == row.id
+        assert json.loads(audit.details_json)["view_type"] == "right_front_three_quarter"
+
+
+def test_confirm_review_triggers_auto_run_intent_when_row_is_ready(tmp_path: Path) -> None:
+    """审核确认后应根据自动运行配置创建后继任务意图。"""
+    client, engine, row, _result = make_client(tmp_path)
+    with Session(engine) as session:  # type: ignore[arg-type]
+        saved = session.get(PromptRow, row.id)
+        assert saved is not None
+        scene = Asset(
+            kind="scene_reference",
+            status="READY",
+            original_filename="scene.png",
+        )
+        sofa = Asset(
+            kind="sofa_product",
+            status="READY",
+            original_filename="sofa.png",
+        )
+        session.add_all((scene, sofa))
+        session.flush()
+        saved.scene_asset_id = scene.id
+        saved.sofa_asset_id = sofa.id
+        saved.auto_run = True
+        session.commit()
+
+    response = client.post(
+        f"/api/v1/rows/{row.id}/review/confirm",
+        json={
+            "expected_revision": 1,
+            "view_override": {
+                "view_type": "right_front_three_quarter",
+                "near_end": "右侧",
+                "far_end": "左侧",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "DEBOUNCING"
+    with Session(engine) as session:  # type: ignore[arg-type]
+        saved = session.get(PromptRow, row.id)
+        intent = session.query(AutoRunIntent).filter_by(row_id=row.id).one()
+        assert saved is not None
+        assert saved.status == RowStatus.DEBOUNCING
+        assert intent.expected_revision == 2
+        assert intent.status == "PENDING"

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { nextTick } from 'vue'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRowsStore, type RowItem } from '@/stores/rows'
 
 /** SSE 生命周期 mock，避免单元测试建立真实连接。 */
@@ -17,6 +17,7 @@ vi.mock('@/services/api', () => ({
     get: vi.fn().mockResolvedValue({ data: { data: [] } }),
     post: vi.fn().mockResolvedValue({ status: 201 }),
   },
+  extractApiError: (_error: unknown, fallback: string) => fallback,
 }))
 
 // Mock Element Plus
@@ -48,6 +49,11 @@ describe('WorkbenchView', () => {
     expect(wrapper.text()).toContain('刷新')
     expect(wrapper.text()).toContain('批量运行')
     expect(wrapper.text()).toContain('批量删除')
+    expect(wrapper.text()).toContain('回收站')
+    expect(wrapper.text()).toContain('导出 JSON')
+    expect(wrapper.text()).toContain('导出 CSV')
+    expect(wrapper.text()).toContain('查询')
+    expect(wrapper.text()).toContain('重置')
     expect((wrapper.vm as unknown as { gridOptions: { rowSelection: { mode: string }; selectionColumnDef: object } }).gridOptions)
       .toMatchObject({ rowSelection: { mode: 'multiRow', checkboxes: true }, selectionColumnDef: { pinned: 'left' } })
     expect(wrapper.text()).toContain('全部任务')
@@ -180,6 +186,67 @@ describe('WorkbenchView', () => {
     expect((wrapper.vm as unknown as { resultOpen: boolean }).resultOpen).toBe(true)
   })
 
+  it('clears old result data before loading another row', async () => {
+    setActivePinia(createPinia())
+    const store = useRowsStore()
+    vi.spyOn(store, 'fetchRows').mockResolvedValue()
+    let resolveResults!: (results: Awaited<ReturnType<typeof store.fetchResults>>) => void
+    vi.spyOn(store, 'fetchResults').mockReturnValue(new Promise(resolve => { resolveResults = resolve }))
+    const WorkbenchView = (await import('@/views/WorkbenchView.vue')).default
+    const wrapper = mount(WorkbenchView, {
+      global: {
+        stubs: {
+          ElButton, AgGridVue: { template: '<div />' }, PromptResultDialog: { template: '<div />' },
+          AssetLibraryDialog: { template: '<div />' }, ElDialog: { template: '<div><slot /></div>' },
+          ElTooltip: { template: '<div><slot /></div>' },
+        },
+      },
+    })
+    const view = wrapper.vm as unknown as {
+      resultItems: Awaited<ReturnType<typeof store.fetchResults>>
+      openResults: (row: RowItem) => Promise<void>
+    }
+    view.resultItems = [{
+      id: 'old', version: 1, positive_prompt: '旧结果', negative_prompt: '', review_status: 'PASSED',
+      review: {}, warnings: [], is_stale: false,
+    }]
+
+    const loadingPromise = view.openResults(createRow('new-row', 'COMPLETED'))
+    await nextTick()
+    expect(view.resultItems).toEqual([])
+    resolveResults([])
+    await loadingPromise
+  })
+
+  it('reports a rejected drag-and-drop asset binding', async () => {
+    setActivePinia(createPinia())
+    const store = useRowsStore()
+    vi.spyOn(store, 'fetchRows').mockResolvedValue()
+    vi.spyOn(store, 'attachExistingAsset').mockRejectedValue(new Error('拖拽失败'))
+    const showError = vi.spyOn(ElMessage, 'error').mockImplementation(() => undefined as never)
+    const WorkbenchView = (await import('@/views/WorkbenchView.vue')).default
+    const wrapper = mount(WorkbenchView, {
+      global: {
+        stubs: {
+          ElButton, AgGridVue: { template: '<div />' }, PromptResultDialog: { template: '<div />' },
+          AssetLibraryDialog: { template: '<div />' }, ElDialog: { template: '<div><slot /></div>' },
+          ElTooltip: { template: '<div><slot /></div>' },
+        },
+      },
+    })
+    const view = wrapper.vm as unknown as {
+      renderImageCell: (data: RowItem, params: { colDef: { field: string; headerName: string } }) => {
+        props: { onDropAsset: (assetId: string, kind: string) => void }
+      }
+    }
+    const cell = view.renderImageCell(createRow('row-1', 'READY'), {
+      colDef: { field: 'scene_asset', headerName: '场景参考图' },
+    })
+
+    cell.props.onDropAsset('asset-1', 'scene_reference')
+    await vi.waitFor(() => expect(showError).toHaveBeenCalledWith('拖拽绑定图片失败'))
+  })
+
   it('renders action buttons with readable Chinese labels', async () => {
     const module = await import('@/views/workbenchCellRenderers')
     expect(typeof module.buildActionCell).toBe('function')
@@ -188,13 +255,14 @@ describe('WorkbenchView', () => {
     const sample = (status: string) => module.collectCellLabels(
       module.buildActionCell(
         { data: { id: 'a', name: 'A', status, row_revision: 1 } } as never,
-        { runRow: noop, openResults: noop, removeRow: noop, openErrorDetail: () => undefined },
+        { runRow: noop, cancelRow: noop, openResults: noop, removeRow: noop, openErrorDetail: () => undefined },
       ),
     )
 
     expect(sample('COMPLETED')).toEqual(expect.arrayContaining(['重新运行', '查看提示词', '删除任务']))
     expect(sample('FAILED')).toEqual(expect.arrayContaining(['重新运行', '查看错误', '删除任务']))
     expect(sample('READY')).toEqual(expect.arrayContaining(['运行', '删除任务']))
+    expect(sample('ANALYZING')).toEqual(expect.arrayContaining(['取消', '删除任务']))
     expect(sample('DRAFT')).toEqual(expect.arrayContaining(['删除任务']))
   })
 })

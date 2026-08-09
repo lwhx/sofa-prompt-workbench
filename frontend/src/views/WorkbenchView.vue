@@ -33,6 +33,24 @@
       >
         批量删除
       </el-button>
+      <el-button
+        :icon="Delete"
+        @click="openTrash"
+      >
+        回收站
+      </el-button>
+      <el-button
+        :icon="Download"
+        @click="exportRows('json')"
+      >
+        导出 JSON
+      </el-button>
+      <el-button
+        :icon="Download"
+        @click="exportRows('csv')"
+      >
+        导出 CSV
+      </el-button>
       <!-- 任务完成通知开关 -->
       <el-tooltip
         :content="notifier.enabled.value ? '关闭完成通知' : '开启完成通知'"
@@ -54,6 +72,45 @@
         <span><strong>{{ completedCount }}</strong> 已完成</span>
       </div>
       <span class="paste-tip">双击名称编辑 · 选中图片格后 Ctrl+V 粘贴</span>
+    </div>
+    <div class="filter-bar">
+      <el-input
+        v-model="searchText"
+        class="search-input"
+        clearable
+        placeholder="搜索任务名称或 ID"
+        :prefix-icon="Search"
+        @keyup.enter="applyFilters"
+        @clear="applyFilters"
+      />
+      <el-select
+        v-model="selectedStatuses"
+        class="status-filter"
+        multiple
+        collapse-tags
+        clearable
+        placeholder="全部状态"
+        @change="applyFilters"
+      >
+        <el-option
+          v-for="option in statusOptions"
+          :key="option.value"
+          :label="option.label"
+          :value="option.value"
+        />
+      </el-select>
+      <el-button
+        type="primary"
+        :icon="Search"
+        :loading="loading"
+        @click="applyFilters"
+      >
+        查询
+      </el-button>
+      <el-button @click="resetFilters">
+        重置
+      </el-button>
+      <span class="filter-result">当前 {{ rows.length }} 条</span>
     </div>
     <!-- SSE 实时连接断开提示条 -->
     <div
@@ -121,7 +178,9 @@
       :results="resultItems"
       :loading="resultLoading"
       :row-id="resultRowId"
-      @deleted="reloadResults"
+      :row-revision="resultRowRevision"
+      :selected-result-id="resultSelectedId"
+      @changed="reloadResults"
     />
     <AssetLibraryDialog
       :visible="libraryOpen"
@@ -129,6 +188,59 @@
       @close="libraryOpen = false"
       @select="onLibrarySelect"
     />
+    <el-dialog
+      v-model="trashOpen"
+      title="回收站"
+      width="min(900px, 92vw)"
+      destroy-on-close
+    >
+      <el-table
+        v-loading="trashLoading"
+        :data="trashRows"
+        empty-text="回收站为空"
+        max-height="55vh"
+      >
+        <el-table-column
+          prop="name"
+          label="任务名称"
+          min-width="200"
+        />
+        <el-table-column
+          prop="status"
+          label="删除前状态"
+          width="130"
+        >
+          <template #default="scope">
+            {{ scope?.row ? (STATUS_MAP[scope.row.status] ?? scope.row.status) : '' }}
+          </template>
+        </el-table-column>
+        <el-table-column
+          prop="deleted_at"
+          label="删除时间"
+          width="180"
+        >
+          <template #default="scope">
+            {{ formatDateTime(scope?.row?.deleted_at) }}
+          </template>
+        </el-table-column>
+        <el-table-column
+          label="操作"
+          width="120"
+          fixed="right"
+        >
+          <template #default="scope">
+            <el-button
+              type="primary"
+              plain
+              :loading="scope?.row ? store.isMutating(scope.row.id) : false"
+              @click="scope?.row && restoreTrashRow(scope.row)"
+            >
+              恢复
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-dialog>
   </div>
 </template>
 
@@ -139,7 +251,7 @@ import { AgGridVue } from 'ag-grid-vue3'
 import { AllCommunityModule, ModuleRegistry } from 'ag-grid-community'
 import type { ColDef, GridApi, GridOptions as AGGridOptions, ICellRendererParams, ValueGetterParams } from 'ag-grid-community'
 import { ElDialog, ElMessageBox, ElButton, ElMessage } from 'element-plus'
-import { Plus, Refresh, Bell } from '@element-plus/icons-vue'
+import { Bell, Delete, Download, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { buildActionCell } from '@/views/workbenchCellRenderers'
 import { createVueCellRenderer, resolvePasteTarget } from '@/views/vueCellRenderer'
 import ImagePasteCell from '@/components/ImagePasteCell.vue'
@@ -157,6 +269,16 @@ const store = useRowsStore()
 const { rows, loading } = storeToRefs(store)
 /** 当前选中的任务行。 */
 const selectedRows = ref<RowItem[]>([])
+/** 搜索输入框文本。 */
+const searchText = ref('')
+/** 当前选中的任务状态。 */
+const selectedStatuses = ref<string[]>([])
+/** 回收站弹窗是否打开。 */
+const trashOpen = ref(false)
+/** 回收站任务列表。 */
+const trashRows = ref<RowItem[]>([])
+/** 回收站列表是否正在加载。 */
+const trashLoading = ref(false)
 /** 批量运行是否正在执行。 */
 const batchRunning = ref(false)
 /** SSE 实时连接是否正常。 */
@@ -171,6 +293,10 @@ const resultOpen = ref(false)
 const resultLoading = ref(false)
 const resultItems = ref<PromptResultItem[]>([])
 const resultRowId = ref<string | null>(null)
+const resultRowRevision = ref(1)
+const resultSelectedId = ref<string | null>(null)
+/** 最近一次结果列表请求的递增序号。 */
+let resultRequestId = 0
 const libraryOpen = ref(false)
 const libraryKind = ref<'scene_reference' | 'sofa_product'>('scene_reference')
 const libraryTargetRow = ref<RowItem | null>(null)
@@ -308,7 +434,9 @@ function renderImageCell(data: unknown, params: ICellRendererParams) {
     onPickFromLibrary: () => openLibrary(row, kind),
     onDropAsset: (assetId: string, assetKind: string) => {
       if (assetKind === kind) {
-        store.attachExistingAsset(row, kind, assetId)
+        store.attachExistingAsset(row, kind, assetId).catch((error: unknown) => {
+          ElMessage.error(extractApiError(error, '拖拽绑定图片失败'))
+        })
       }
     },
   })
@@ -320,6 +448,8 @@ const STATUS_MAP: Record<string, string> = {
   REPAIRING: '修复中', NEEDS_REVIEW: '待审核', COMPLETED: '已完成', FAILED: '失败',
   CANCELING: '取消中', CANCELED: '已取消', DIRTY: '输入已变更',
 }
+/** 状态筛选选项。 */
+const statusOptions = Object.entries(STATUS_MAP).map(([value, label]) => ({ value, label }))
 /** 进行中状态集合（蓝色 + 脉冲动画）。 */
 const ACTIVE_STATUS_TYPES = new Set(['UPLOADING', 'DEBOUNCING', 'QUEUED', 'ANALYZING', 'VALIDATING', 'REPAIRING', 'CANCELING'])
 /** 状态 → 视觉类型映射。进行中=primary，完成=success，失败=danger，待审核=warning。 */
@@ -399,10 +529,22 @@ function renderStatusCell(data: unknown) {
 function renderActionCell(data: unknown) {
   return buildActionCell({ data: data as RowItem } as ICellRendererParams, {
     runRow: store.runRow,
+    cancelRow,
     openResults,
     removeRow,
     openErrorDetail,
   })
+}
+
+async function cancelRow(row: RowItem): Promise<void> {
+  try {
+    await ElMessageBox.confirm('确定取消当前任务吗？', '取消任务', { type: 'warning' })
+    await store.cancelRow(row)
+    ElMessage.success('已提交取消请求')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(extractApiError(error, '取消任务失败'))
+  }
 }
 
 const columnDefs = computed<ColDef[]>(() => [
@@ -438,6 +580,74 @@ async function handleRefresh(): Promise<void> {
   } catch (error) {
     ElMessage.error(extractApiError(error, '刷新失败'))
   }
+}
+
+/** 应用搜索与状态筛选条件。 */
+async function applyFilters(): Promise<void> {
+  try {
+    await store.fetchRows({ search: searchText.value, status: selectedStatuses.value })
+  } catch (error) {
+    ElMessage.error(extractApiError(error, '筛选任务失败'))
+  }
+}
+
+/** 清空搜索与状态筛选条件。 */
+async function resetFilters(): Promise<void> {
+  searchText.value = ''
+  selectedStatuses.value = []
+  await applyFilters()
+}
+
+/**
+ * 导出当前筛选结果。
+ * @param format - 导出文件格式。
+ */
+async function exportRows(format: 'json' | 'csv'): Promise<void> {
+  try {
+    await store.exportRows(format)
+    ElMessage.success(`已导出 ${format.toUpperCase()} 文件`)
+  } catch (error) {
+    ElMessage.error(extractApiError(error, '导出任务失败'))
+  }
+}
+
+/** 加载并打开回收站。 */
+async function openTrash(): Promise<void> {
+  trashOpen.value = true
+  trashLoading.value = true
+  try {
+    const response = await api.get('/api/v1/rows', { params: { only_deleted: true } })
+    trashRows.value = response.data?.data ?? []
+  } catch (error) {
+    ElMessage.error(extractApiError(error, '加载回收站失败'))
+  } finally {
+    trashLoading.value = false
+  }
+}
+
+/**
+ * 恢复回收站任务并刷新两个列表。
+ * @param row - 要恢复的软删除任务。
+ */
+async function restoreTrashRow(row: RowItem): Promise<void> {
+  try {
+    await store.restoreRow(row)
+    trashRows.value = trashRows.value.filter(item => item.id !== row.id)
+    ElMessage.success('任务已恢复')
+  } catch (error) {
+    ElMessage.error(extractApiError(error, '恢复任务失败'))
+  }
+}
+
+/**
+ * 格式化 ISO 时间用于表格展示。
+ * @param value - ISO 时间字符串。
+ * @returns 本地可读时间，空值返回短横线。
+ */
+function formatDateTime(value?: string | null): string {
+  if (!value) return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
 }
 
 /** 串行运行选区内所有可运行任务，逐条容错并汇总。 */
@@ -516,10 +726,19 @@ async function removeRow(row: RowItem) {
   }
 }
 async function openResults(row: RowItem) {
+  const requestId = ++resultRequestId
   resultRowId.value = row.id
+  resultRowRevision.value = row.row_revision
+  resultSelectedId.value = row.selected_result_id ?? null
   resultOpen.value = true
+  resultItems.value = []
   resultLoading.value = true
-  try { resultItems.value = await store.fetchResults(row.id) } finally { resultLoading.value = false }
+  try {
+    const latestResults = await store.fetchResults(row.id)
+    if (requestId === resultRequestId && resultRowId.value === row.id) resultItems.value = latestResults
+  } finally {
+    if (requestId === resultRequestId) resultLoading.value = false
+  }
 }
 /** 删除结果后刷新结果列表和行数据（结果数列同步更新） */
 async function reloadResults() {
@@ -528,6 +747,11 @@ async function reloadResults() {
   try {
     resultItems.value = await store.fetchResults(resultRowId.value)
     await store.fetchRows()
+    const currentRow = rows.value.find(row => row.id === resultRowId.value)
+    if (currentRow) {
+      resultRowRevision.value = currentRow.row_revision
+      resultSelectedId.value = currentRow.selected_result_id ?? null
+    }
   } finally { resultLoading.value = false }
 }
 
@@ -621,6 +845,13 @@ onUnmounted(() => {
   display: flex; align-items: center; gap: 16px; padding: 10px 16px;
   border-bottom: 1px solid #dfe3e8; background: #fff; flex-shrink: 0;
 }
+.filter-bar {
+  display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+  border-bottom: 1px solid #dfe3e8; background: #fff; flex-shrink: 0;
+}
+.search-input { width: 280px; }
+.status-filter { width: 220px; }
+.filter-result { color: #657080; font-size: 12px; }
 .workbench-summary { display: flex; align-items: center; gap: 4px; color: #657080; font-size: 12px; }
 .workbench-summary span { padding: 4px 10px; border-left: 1px solid #e5e8ec; white-space: nowrap; }
 .workbench-summary strong { margin-right: 4px; color: #202734; font-size: 14px; font-variant-numeric: tabular-nums; }
@@ -685,6 +916,8 @@ onUnmounted(() => {
 
 @media (max-width: 820px) {
   .toolbar { gap: 8px; padding: 8px; flex-wrap: wrap; }
+  .filter-bar { padding: 8px; flex-wrap: wrap; }
+  .search-input, .status-filter { width: 100%; }
   .workbench-summary span { padding: 4px 6px; }
   .paste-tip { display: none; }
   .grid-container { padding: 8px; overflow-x: auto; }

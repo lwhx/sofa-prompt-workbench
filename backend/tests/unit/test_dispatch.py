@@ -1,12 +1,18 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import create_database_engine
 from app.enums import JobStatus
 from app.models import Base, Job, JobDispatchOutbox, PromptRow
-from app.services.dispatch import create_job_and_outbox, dispatch_pending_outbox
+from app.services.dispatch import (
+    create_job_and_outbox,
+    dispatch_pending_outbox,
+    recover_lost_queued_jobs,
+)
 
 
 def make_session(tmp_path: Path) -> Session:
@@ -75,8 +81,6 @@ def test_dispatch_is_idempotent_with_deterministic_job_id(tmp_path: Path) -> Non
 
 
 def test_expired_dispatching_lease_is_reclaimed(tmp_path: Path) -> None:
-    from datetime import UTC, datetime, timedelta
-
     with make_session(tmp_path) as session:
         row = PromptRow(sort_key=10, name="lease", row_revision=1)
         session.add(row)
@@ -103,3 +107,64 @@ def test_expired_dispatching_lease_is_reclaimed(tmp_path: Path) -> None:
 
         assert count == 1
         assert sent == [job_id]
+
+
+def test_missing_queued_job_is_restored_to_pending_outbox(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        row = PromptRow(sort_key=10, name="队列恢复", row_revision=1)
+        session.add(row)
+        session.commit()
+        job_id = create_job_and_outbox(
+            session,
+            row_id=row.id,
+            expected_revision=1,
+            input_fingerprint="recover-fp",
+            input_snapshot={"row_id": row.id},
+        )
+        dispatch_pending_outbox(session, enqueue=lambda _job_id, _queue_name: None)
+        job = session.get(Job, job_id)
+        assert job is not None
+        job.created_at = datetime.now(UTC) - timedelta(minutes=5)
+        session.commit()
+
+        recovered = recover_lost_queued_jobs(
+            session,
+            queue_contains=lambda _job_id, _queue_name: False,
+        )
+
+        session.expire_all()
+        outbox = session.scalar(
+            select(JobDispatchOutbox).where(JobDispatchOutbox.job_id == job_id)
+        )
+        assert recovered == 1
+        assert session.get(Job, job_id).status == JobStatus.PENDING_DISPATCH  # type: ignore[union-attr]
+        assert outbox is not None
+        assert outbox.status == "PENDING"
+        assert outbox.last_error == "QUEUE_ENTRY_MISSING"
+
+
+def test_cancel_requested_job_is_not_silently_reused(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        row = PromptRow(sort_key=10, name="取消中", row_revision=3)
+        session.add(row)
+        session.flush()
+        old_job = Job(
+            row_id=row.id,
+            status=JobStatus.CANCEL_REQUESTED,
+            row_revision=1,
+            input_fingerprint="old",
+            input_snapshot_json="{}",
+        )
+        session.add(old_job)
+        session.flush()
+        row.active_job_id = old_job.id
+        session.commit()
+
+        with pytest.raises(ValueError, match="ACTIVE_JOB_CONFLICT"):
+            create_job_and_outbox(
+                session,
+                row_id=row.id,
+                expected_revision=3,
+                input_fingerprint="new",
+                input_snapshot={"row_id": row.id},
+            )

@@ -20,6 +20,12 @@
         <div class="result-head">
           <strong>版本 {{ latest.version }}</strong>
           <span>{{ latest.review_status === 'PASSED' ? '已完成' : '待审核' }}</span>
+          <el-tag
+            v-if="latest.id === selectedResultId"
+            type="success"
+          >
+            正式版本
+          </el-tag>
           <small v-if="latest.created_at">{{ latest.created_at }}</small>
         </div>
         <section>
@@ -33,7 +39,24 @@
                 复制正向提示词
               </el-button>
               <el-button
-                v-if="results.length > 1"
+                :disabled="latest.is_stale || latest.id === selectedResultId"
+                :loading="selecting"
+                size="small"
+                type="primary"
+                @click="selectResult(latest)"
+              >
+                {{ latest.id === selectedResultId ? '已选为正式版' : '选为正式版' }}
+              </el-button>
+              <el-button
+                v-if="latest.review_status === 'NEEDS_REVIEW'"
+                size="small"
+                type="warning"
+                @click="openReview(latest)"
+              >
+                确认人工方向
+              </el-button>
+              <el-button
+                v-if="results.length > 1 && latest.id !== selectedResultId"
                 size="small"
                 type="danger"
                 plain
@@ -83,7 +106,7 @@
               版本 {{ result.version }} · {{ result.review_status }}
             </button>
             <el-button
-              v-if="result.id !== selectedId || results.length > 1"
+              v-if="result.id !== selectedResultId"
               size="small"
               type="danger"
               text
@@ -95,6 +118,42 @@
         </details>
       </template>
     </div>
+    <el-dialog
+      v-model="reviewOpen"
+      title="人工方向审核确认"
+      width="min(560px, 90vw)"
+      append-to-body
+    >
+      <el-form label-width="88px">
+        <el-form-item label="视角方向">
+          <el-input v-model="reviewForm.view_type" />
+        </el-form-item>
+        <el-form-item label="近端">
+          <el-input v-model="reviewForm.near_end" />
+        </el-form-item>
+        <el-form-item label="远端">
+          <el-input v-model="reviewForm.far_end" />
+        </el-form-item>
+        <el-form-item label="审核备注">
+          <el-input
+            v-model="reviewForm.note"
+            type="textarea"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="reviewOpen = false">
+          取消
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="confirming"
+          @click="confirmReview"
+        >
+          确认方向并重新生成
+        </el-button>
+      </template>
+    </el-dialog>
   </el-dialog>
 </template>
 
@@ -109,13 +168,20 @@ const props = defineProps<{
   results: PromptResultItem[]
   loading: boolean
   rowId: string | null
+  rowRevision: number
+  selectedResultId: string | null
 }>()
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
-  deleted: []
+  changed: []
 }>()
 const selectedId = ref<string | null>(null)
 const deleting = ref(false)
+const selecting = ref(false)
+const confirming = ref(false)
+const reviewOpen = ref(false)
+const reviewResultId = ref<string | null>(null)
+const reviewForm = ref({ view_type: '', near_end: '', far_end: '', note: '' })
 const latest = computed(() => props.results.find(item => item.id === selectedId.value) ?? props.results[0])
 watch(() => props.results, results => { selectedId.value = results[0]?.id ?? null }, { immediate: true })
 
@@ -132,12 +198,65 @@ async function removeResult(result: PromptResultItem) {
   try {
     await api.delete(`/api/v1/rows/${props.rowId}/results/${result.id}`)
     ElMessage.success('已删除')
-    emit('deleted')
+    emit('changed')
   } catch (err: unknown) {
     const msg = (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message
     ElMessage.error(msg ?? '删除失败')
   } finally {
     deleting.value = false
+  }
+}
+
+async function selectResult(result: PromptResultItem) {
+  if (!props.rowId || result.id === props.selectedResultId) return
+  selecting.value = true
+  try {
+    await api.post(`/api/v1/rows/${props.rowId}/results/${result.id}/select`, {
+      expected_revision: props.rowRevision,
+    })
+    ElMessage.success('已设为正式版本')
+    emit('changed')
+  } catch (err: unknown) {
+    const msg = (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message
+    ElMessage.error(msg ?? '正式选版失败')
+  } finally {
+    selecting.value = false
+  }
+}
+
+function openReview(result: PromptResultItem) {
+  reviewResultId.value = result.id
+  reviewForm.value = {
+    view_type: result.sofa_view?.view_type ?? '',
+    near_end: result.sofa_view?.near_end ?? '',
+    far_end: result.sofa_view?.far_end ?? '',
+    note: '',
+  }
+  reviewOpen.value = true
+}
+
+async function confirmReview() {
+  if (!props.rowId || !reviewResultId.value) return
+  confirming.value = true
+  try {
+    await api.post(`/api/v1/rows/${props.rowId}/review/confirm`, {
+      expected_revision: props.rowRevision,
+      result_id: reviewResultId.value,
+      view_override: {
+        view_type: reviewForm.value.view_type,
+        near_end: reviewForm.value.near_end,
+        far_end: reviewForm.value.far_end,
+      },
+      note: reviewForm.value.note || null,
+    })
+    reviewOpen.value = false
+    ElMessage.success('人工方向已确认，任务将按确认方向重新生成')
+    emit('changed')
+  } catch (err: unknown) {
+    const msg = (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message
+    ElMessage.error(msg ?? '人工方向确认失败')
+  } finally {
+    confirming.value = false
   }
 }
 </script>

@@ -6,6 +6,8 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from app.security.outbound import request_outbound, validate_outbound_url
+
 
 class OneImgUploadError(RuntimeError):
     pass
@@ -25,15 +27,29 @@ class OneImgUploadResult:
 
 
 class OneImgClient:
-    def __init__(self, base_url: str, token: str, *, timeout_seconds: float = 120) -> None:
-        self.base_url = base_url.rstrip("/") + "/"
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        timeout_seconds: float = 120,
+        allow_private_networks: bool = False,
+    ) -> None:
+        self.allow_private_networks = allow_private_networks
+        self.base_url = validate_outbound_url(
+            base_url,
+            allow_private_networks=allow_private_networks,
+            strip_query=True,
+        ).rstrip("/") + "/"
         self.token = token
         self.timeout_seconds = timeout_seconds
 
     def upload_image(self, filename: str, content: bytes, mime_type: str) -> OneImgUploadResult:
         try:
-            response = httpx.post(
+            response = request_outbound(
+                "POST",
                 urljoin(self.base_url, "api/upload/images"),
+                allow_private_networks=self.allow_private_networks,
                 headers={"Authorization": f"oneimg_token={self.token}"},
                 files={"images[]": (filename, content, mime_type)},
                 timeout=self.timeout_seconds,

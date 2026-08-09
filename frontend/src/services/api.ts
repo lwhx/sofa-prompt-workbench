@@ -28,7 +28,7 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (response) => response,
   (error: AxiosError) => {
-    if (error.response?.status === 401) {
+    if (isAuthenticationRedirectRequired(error)) {
       window.location.href = '/login'
       return Promise.reject(error)
     }
@@ -43,6 +43,16 @@ api.interceptors.response.use(
     return Promise.reject(error)
   },
 )
+
+/**
+ * 判断接口异常是否需要跳转登录页。
+ * @param error - Axios 接口异常。
+ * @returns 非登录接口返回 401 时为 true。
+ */
+export function isAuthenticationRedirectRequired(error: AxiosError): boolean {
+  const requestPath = error.config?.url?.split('?')[0]
+  return error.response?.status === 401 && requestPath !== '/api/v1/auth/login'
+}
 
 /**
  * 从 axios 错误或普通错误中提取用户可读的消息。

@@ -111,6 +111,8 @@ const assets = ref<AssetItem[]>([])
 const loading = ref(false)
 const searchText = ref('')
 const selectedId = ref<string | null>(null)
+/** 最近一次资产列表请求的递增序号。 */
+let assetsRequestId = 0
 
 const kindLabel = computed(() =>
   props.kind === 'scene_reference' ? '场景参考' : '沙发产品',
@@ -126,17 +128,22 @@ const filtered = computed(() => {
 
 watch(() => props.visible, async (v) => {
   if (v) {
+    const requestId = ++assetsRequestId
     selectedId.value = null
     searchText.value = ''
+    assets.value = []
     loading.value = true
     try {
-      assets.value = await store.fetchAssets(props.kind)
+      const latestAssets = await store.fetchAssets(props.kind)
+      if (requestId === assetsRequestId && props.visible) assets.value = latestAssets
     } finally {
-      loading.value = false
+      if (requestId === assetsRequestId) loading.value = false
     }
     /** 打开后自动聚焦搜索框，便于键盘操作。 */
     await nextTick()
     document.querySelector<HTMLInputElement>('.search-input')?.focus()
+  } else {
+    assetsRequestId++
   }
 })
 

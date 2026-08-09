@@ -17,11 +17,13 @@ from app.errors import AppError, success
 from app.models import AICapabilityProfile, AuditEvent, PromptTemplate
 from app.services.ai_config import (
     AIConfiguration,
+    delete_ai_configuration,
     load_ai_configuration,
     public_ai_configuration,
     save_ai_configuration,
 )
 from app.services.audit import record_audit
+from app.security.outbound import request_outbound
 
 router = APIRouter(prefix="/admin", tags=["管理"])
 
@@ -168,6 +170,24 @@ def get_ai_capability(
     return success(public_ai_configuration(configuration))
 
 
+@router.delete("/ai-capability")
+def delete_ai_capability(
+    user: CurrentUser,
+    db: DatabaseSession,
+    settings: Annotated[Settings, Depends(get_settings_from_request)],
+) -> dict[str, Any]:
+    """清空 AI 配置并记录安全审计。"""
+    configuration = delete_ai_configuration(db, settings)
+    record_audit(
+        db,
+        event_type="AI_CONFIGURATION_DELETED",
+        actor_user_id=user.id,
+        details={"provider": configuration.provider},
+    )
+    db.commit()
+    return success(public_ai_configuration(configuration))
+
+
 @router.put("/ai-capability")
 def update_ai_capability(
     payload: AIConfigurationUpdate,
@@ -219,8 +239,10 @@ def test_ai_capability(
     if configuration.configured:
         endpoint = urljoin(str(configuration.base_url).rstrip("/") + "/", "models")
         try:
-            response = httpx.get(
+            response = request_outbound(
+                "GET",
                 endpoint,
+                allow_private_networks=settings.ssrf_allow_private_networks,
                 headers={"Authorization": f"Bearer {configuration.api_key}"},
                 timeout=min(configuration.timeout_seconds, 30.0),
             )

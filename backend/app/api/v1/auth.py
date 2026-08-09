@@ -1,6 +1,5 @@
 import hashlib
 from datetime import UTC, datetime, timedelta
-from threading import Lock
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -17,17 +16,16 @@ from app.dependencies import (
 )
 from app.errors import AppError, success
 from app.models import AdminSession, AdminUser, new_id
+from app.security.client_ip import resolve_client_ip, validate_production_trusted_proxies
+from app.security.login_rate_limit import (
+    allow_redis_login_attempt,
+    memory_login_rate_limiter,
+    rate_limit_keys,
+)
 from app.security.password import verify_password
 from app.security.session import SessionPayload, create_session_token
 
 router = APIRouter(prefix="/auth", tags=["认证"])
-
-# 内存级登录速率限制：{ip: [timestamp, ...]}
-# 窗口 60 秒，超过 login_rate_limit 次则拒绝
-_login_attempts: dict[str, list[datetime]] = {}
-_login_lock = Lock()
-_LOGIN_WINDOW_SECONDS = 60
-_LOGIN_MAX_TRACKED_IPS = 10_000
 
 
 class LoginRequest(BaseModel):
@@ -43,24 +41,35 @@ def login(
     db: DatabaseSession,
     settings: Annotated[Settings, Depends(get_settings_from_request)],
 ) -> dict[str, object]:
-    # 速率限制检查（线程安全 + 自动清理过期 IP）
-    client_ip = request.client.host if request.client else "unknown"
-    now = datetime.now(UTC)
-    cutoff = now - timedelta(seconds=_LOGIN_WINDOW_SECONDS)
-    with _login_lock:
-        recent = [t for t in _login_attempts.get(client_ip, []) if t > cutoff]
-        if len(recent) >= settings.login_rate_limit:
+    if settings.app_env == "production":
+        validate_production_trusted_proxies(settings.trusted_proxies)
+    client_ip = resolve_client_ip(request, settings.trusted_proxies)
+    keys = rate_limit_keys(client_ip, payload.username)
+    try:
+        allowed = allow_redis_login_attempt(
+            request.app.state.redis_client,
+            keys,
+            limit=settings.login_rate_limit,
+            window_seconds=settings.login_rate_limit_window_seconds,
+        )
+    except Exception as exc:
+        if settings.app_env != "development" or not settings.login_rate_limit_development_fallback:
             raise AppError(
-                "RATE_LIMITED",
-                "登录尝试过于频繁，请稍后再试",
-                status_code=429,
-            )
-        _login_attempts[client_ip] = recent + [now]
-        # 防止内存泄漏：清理过期的 IP 条目，上限保护
-        if len(_login_attempts) > _LOGIN_MAX_TRACKED_IPS:
-            expired_ips = [ip for ip, times in _login_attempts.items() if not any(t > cutoff for t in times)]
-            for ip in expired_ips:
-                del _login_attempts[ip]
+                "AUTH_SERVICE_UNAVAILABLE",
+                "登录服务暂时不可用，请稍后再试",
+                status_code=503,
+            ) from exc
+        allowed = memory_login_rate_limiter.allow(
+            keys,
+            limit=settings.login_rate_limit,
+            window_seconds=settings.login_rate_limit_window_seconds,
+        )
+    if not allowed:
+        raise AppError(
+            "RATE_LIMITED",
+            "登录尝试过于频繁，请稍后再试",
+            status_code=429,
+        )
 
     user = db.scalar(select(AdminUser).where(AdminUser.username == payload.username))
     password_ok = verify_password(user.password_hash, payload.password) if user else False
@@ -125,4 +134,3 @@ def logout(
     response.delete_cookie("spw_session", path="/")
     response.delete_cookie("spw_csrf", path="/")
     return success({"logged_out": True})
-

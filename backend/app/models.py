@@ -215,11 +215,13 @@ class PromptResult(Base):
     is_stale: Mapped[bool] = mapped_column(Boolean, default=False)
     selected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     manual_edit_note: Mapped[str | None] = mapped_column(Text)
+    hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class AutoRunIntent(Base):
     __tablename__ = "auto_run_intents"
+    __table_args__ = (Index("ix_auto_run_intents_status_due_at", "status", "due_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     row_id: Mapped[str] = mapped_column(ForeignKey("prompt_rows.id"), unique=True)
@@ -227,6 +229,10 @@ class AutoRunIntent(Base):
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(32), default="PENDING")
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 

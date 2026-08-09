@@ -11,6 +11,7 @@ def test_local_inline_mode_dispatches_without_redis(monkeypatch) -> None:
     fake_settings = SimpleNamespace(
         local_inline_worker=True,
         ai_timeout_seconds=240,
+        auto_run_lease_seconds=120,
     )
     fake_session = object()
 
@@ -42,6 +43,8 @@ def test_local_inline_mode_dispatches_without_redis(monkeypatch) -> None:
     )
     monkeypatch.setattr(dispatcher, "Session", FakeSessionContext)
     monkeypatch.setattr(dispatcher, "dispatch_pending_outbox", fake_dispatch)
+    monkeypatch.setattr(dispatcher, "consume_due_auto_run_intents", lambda _session, **_kwargs: 0)
+    monkeypatch.setattr(dispatcher, "recover_lost_queued_jobs", lambda _session, **_kwargs: 0)
     monkeypatch.setattr(dispatcher, "run_prompt_job", executed_jobs.append)
     monkeypatch.setattr(dispatcher, "reap_stale_jobs", lambda _session: 0)
 

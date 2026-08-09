@@ -1,16 +1,17 @@
-import json
-from datetime import UTC, datetime
+import asyncio
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
-from app.api.v1.events import _event_fingerprint
+from app.api.v1.events import EventWatermarkHub
 from app.config import Settings
 from app.database import create_database_engine
-from app.enums import JobStatus, RowStatus
+from app.enums import RowStatus
 from app.main import create_app
-from app.models import AdminUser, Base, Job, PromptResult, PromptRow
+from app.models import AdminUser, Base, PromptRow
 from app.security.password import hash_password
 
 
@@ -49,88 +50,42 @@ def test_sse_emits_initial_invalidation_event(tmp_path: Path) -> None:
     assert '"scope":"rows"' in content
 
 
-def _make_result(row: PromptRow, *, version: int) -> PromptResult:
-    payload = {"positive_prompt": "测试提示词", "negative_prompt": "镜像"}
-    return PromptResult(
-        row_id=row.id,
-        version=version,
-        source="ai",
-        schema_version=1,
-        result_payload_json=json.dumps(payload, ensure_ascii=False),
-        sofa_view_json="{}",
-        sofa_product_json="{}",
-        scene_observations_json="{}",
-        composition_plan_json="{}",
-        review_json="{}",
-        positive_prompt=payload["positive_prompt"],
-        negative_prompt=payload["negative_prompt"],
-        warnings_json="[]",
-        validation_json="{}",
-        review_status="PASSED",
-        row_revision=row.row_revision,
-        input_fingerprint="fingerprint",
-    )
-
-
-def test_event_fingerprint_changes_with_row_job_and_result(tmp_path: Path) -> None:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'event-fingerprint.db'}")
+@pytest.mark.asyncio
+async def test_event_watermark_hub_shares_one_lightweight_poll_for_all_subscribers(
+    tmp_path: Path,
+) -> None:
+    engine = create_database_engine(f"sqlite:///{tmp_path / 'event-watermark.db'}")
     Base.metadata.create_all(engine)
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    hub = EventWatermarkHub(engine, poll_interval_seconds=0.01)
+    first = hub.subscribe()
+    second = hub.subscribe()
+    await asyncio.sleep(0.02)
+
     with Session(engine) as session:
         row = PromptRow(sort_key=10, status=RowStatus.READY)
         session.add(row)
         session.commit()
-        initial = _event_fingerprint(session)
 
-        row.row_revision += 1
-        row.status = RowStatus.QUEUED
-        session.commit()
-        row_changed = _event_fingerprint(session)
-        assert row_changed != initial
+    await asyncio.wait_for(first.get(), timeout=0.2)
+    await asyncio.wait_for(second.get(), timeout=0.2)
+    await hub.unsubscribe(first)
+    await hub.unsubscribe(second)
 
-        job = Job(
-            row_id=row.id,
-            status=JobStatus.RUNNING,
-            row_revision=row.row_revision,
-            input_fingerprint="fingerprint",
-            input_snapshot_json="{}",
-            progress_percent=10,
-        )
-        session.add(job)
-        session.commit()
-        job_added = _event_fingerprint(session)
-        assert job_added != row_changed
-
-        job.progress_percent = 50
-        job.status = JobStatus.VALIDATING
-        session.commit()
-        job_changed = _event_fingerprint(session)
-        assert job_changed != job_added
-
-        result = _make_result(row, version=1)
-        session.add(result)
-        session.commit()
-        result_added = _event_fingerprint(session)
-        assert result_added != job_changed
-
-        session.delete(result)
-        session.commit()
-        assert _event_fingerprint(session) != result_added
-
-
-def test_event_fingerprint_ignores_soft_deleted_rows(tmp_path: Path) -> None:
-    engine = create_database_engine(f"sqlite:///{tmp_path / 'event-visibility.db'}")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        row = PromptRow(sort_key=10, status=RowStatus.READY)
-        session.add(row)
-        session.commit()
-        row.deleted_at = datetime.now(UTC)
-        session.commit()
-        hidden = _event_fingerprint(session)
-
-        row.row_revision += 1
-        row.status = RowStatus.FAILED
-        session.add(_make_result(row, version=1))
-        session.commit()
-
-        assert _event_fingerprint(session) == hidden
+    normalized = [statement.strip().upper() for statement in statements]
+    assert normalized
+    poll_statements = [statement for statement in normalized if statement == "PRAGMA DATA_VERSION"]
+    assert poll_statements
+    assert not any(statement.startswith("SELECT") for statement in normalized)

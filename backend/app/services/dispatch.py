@@ -12,10 +12,30 @@ from app.enums import JobStatus, RowStatus
 from app.models import Job, JobDispatchOutbox, PromptRow
 
 Enqueue = Callable[[str, str], None]
+QueueContains = Callable[[str, str], bool]
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _reusable_active_job(
+    job: Job | None,
+    *,
+    expected_revision: int,
+    input_fingerprint: str,
+) -> Job | None:
+    if job is None or job.status not in {
+        JobStatus.PENDING_DISPATCH,
+        JobStatus.QUEUED,
+        JobStatus.RUNNING,
+        JobStatus.VALIDATING,
+        JobStatus.REPAIRING,
+    }:
+        return None
+    if job.row_revision != expected_revision or job.input_fingerprint != input_fingerprint:
+        raise ValueError("ACTIVE_JOB_CONFLICT")
+    return job
 
 
 def create_job_and_outbox(
@@ -27,6 +47,7 @@ def create_job_and_outbox(
     input_snapshot: dict[str, object],
     queue_name: str = "prompt-generation",
     row_status_after_create: RowStatus | None = None,
+    commit: bool = True,
 ) -> str:
     row = session.get(PromptRow, row_id)
     if row is None:
@@ -34,7 +55,14 @@ def create_job_and_outbox(
     if row.row_revision != expected_revision:
         raise ValueError("ROW_REVISION_CONFLICT")
     if row.active_job_id:
-        return row.active_job_id
+        active_job = _reusable_active_job(
+            session.get(Job, row.active_job_id),
+            expected_revision=expected_revision,
+            input_fingerprint=input_fingerprint,
+        )
+        if active_job is None:
+            raise ValueError("ACTIVE_JOB_CONFLICT")
+        return active_job.id
 
     job = Job(
         row_id=row.id,
@@ -74,7 +102,8 @@ def create_job_and_outbox(
         )
         if getattr(updated, "rowcount", 0) != 1:
             raise IntegrityError("row CAS failed", {}, RuntimeError("row CAS failed"))
-        session.commit()
+        if commit:
+            session.commit()
     except IntegrityError:
         session.rollback()
         existing = session.scalar(
@@ -94,7 +123,14 @@ def create_job_and_outbox(
         )
         if existing is None:
             raise
-        return existing.id
+        reusable_job = _reusable_active_job(
+            existing,
+            expected_revision=expected_revision,
+            input_fingerprint=input_fingerprint,
+        )
+        if reusable_job is None:
+            raise ValueError("ACTIVE_JOB_CONFLICT") from None
+        return reusable_job.id
     return job.id
 
 
@@ -198,3 +234,47 @@ def dispatch_pending_outbox(session: Session, *, enqueue: Enqueue, limit: int = 
             session.rollback()
         dispatched += 1
     return dispatched
+
+
+def recover_lost_queued_jobs(
+    session: Session,
+    *,
+    queue_contains: QueueContains,
+    minimum_age_seconds: float = 120.0,
+    limit: int = 50,
+) -> int:
+    cutoff = utc_now() - timedelta(seconds=minimum_age_seconds)
+    jobs = session.scalars(
+        select(Job)
+        .where(Job.status == JobStatus.QUEUED, Job.created_at <= cutoff)
+        .order_by(Job.created_at)
+        .limit(limit)
+    ).all()
+    recovered = 0
+    for job in jobs:
+        rq_job_id = job.rq_job_id or job.id
+        if queue_contains(rq_job_id, job.queue_name):
+            continue
+        restored = session.execute(
+            update(Job)
+            .where(Job.id == job.id, Job.status == JobStatus.QUEUED)
+            .values(status=JobStatus.PENDING_DISPATCH, rq_job_id=None)
+            .execution_options(synchronize_session=False)
+        )
+        if getattr(restored, "rowcount", 0) != 1:
+            session.rollback()
+            continue
+        session.execute(
+            update(JobDispatchOutbox)
+            .where(JobDispatchOutbox.job_id == job.id)
+            .values(
+                status="PENDING",
+                next_attempt_at=utc_now(),
+                last_error="QUEUE_ENTRY_MISSING",
+                updated_at=utc_now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        session.commit()
+        recovered += 1
+    return recovered

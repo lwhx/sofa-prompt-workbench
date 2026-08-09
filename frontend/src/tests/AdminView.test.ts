@@ -8,9 +8,11 @@ const get = vi.fn()
 const post = vi.fn()
 /** 管理接口 PUT mock。 */
 const put = vi.fn()
+/** 管理接口 DELETE mock。 */
+const deleteRequest = vi.fn()
 
 vi.mock('@/services/api', () => ({
-  api: { get, post, put },
+  api: { get, post, put, delete: deleteRequest },
   /** 提取 API 错误消息的 mock：直接返回兜底文案。 */
   extractApiError: vi.fn((reason: unknown, fallback: string) => {
     const err = reason as { response?: { data?: { error?: { message?: string } } } }
@@ -24,11 +26,13 @@ const message = vi.hoisted(() => ({
   warning: vi.fn(),
   error: vi.fn(),
 }))
+/** Element Plus 确认框 mock。 */
+const messageBox = vi.hoisted(() => ({ confirm: vi.fn() }))
 
 vi.mock('element-plus', async (importOriginal) => {
   /** Element Plus 原始模块。 */
   const original = await importOriginal<typeof import('element-plus')>()
-  return { ...original, ElMessage: message }
+  return { ...original, ElMessage: message, ElMessageBox: messageBox }
 })
 
 /** 提示词模板测试数据。 */
@@ -48,7 +52,19 @@ async function mountAdminView() {
   const AdminView = (await import('@/views/AdminView.vue')).default
   /** 管理页面测试包装器。 */
   const wrapper = mount(AdminView, {
-    global: { plugins: [ElementPlus] },
+    global: {
+      plugins: [ElementPlus],
+      stubs: {
+        ElTag: false,
+        ElInput: false,
+        ElFormItem: false,
+        ElForm: false,
+        ElOption: false,
+        ElSelect: false,
+        ElTableColumn: false,
+        ElTable: false,
+      },
+    },
   })
   await flushPromises()
   return wrapper
@@ -58,10 +74,14 @@ beforeEach(() => {
   get.mockReset()
   post.mockReset()
   put.mockReset()
+  deleteRequest.mockReset()
+  messageBox.confirm.mockReset()
   Object.values(message).forEach(mock => mock.mockReset())
   get.mockResolvedValue({ data: { data: [template] } })
   post.mockResolvedValue({ data: { data: {} } })
   put.mockResolvedValue({ data: { data: {} } })
+  deleteRequest.mockResolvedValue({ data: { data: {} } })
+  messageBox.confirm.mockResolvedValue(undefined)
 })
 
 describe('AdminView', () => {
@@ -128,6 +148,28 @@ describe('AdminView', () => {
       timeout_seconds: 180,
     })
     expect(message.success).toHaveBeenCalledWith('AI 配置已保存并立即生效')
+  })
+
+  it('deletes AI capability configuration after confirmation', async () => {
+    const wrapper = await mountAdminView()
+    const view = wrapper.vm as unknown as { deleteCapability: () => Promise<void> }
+
+    await view.deleteCapability()
+
+    expect(messageBox.confirm).toHaveBeenCalled()
+    expect(deleteRequest).toHaveBeenCalledWith('/api/v1/admin/ai-capability')
+    expect(message.success).toHaveBeenCalledWith('AI 配置已删除')
+  })
+
+  it('reports unavailable AI connection as failure', async () => {
+    post.mockResolvedValueOnce({ data: { data: { status: 'UNAVAILABLE', details: { http_status: 401 } } } })
+    const wrapper = await mountAdminView()
+    const view = wrapper.vm as unknown as { testCapability: () => Promise<void> }
+
+    await view.testCapability()
+
+    expect(message.error).toHaveBeenCalledWith('AI 连接测试失败：HTTP 401')
+    expect(message.success).not.toHaveBeenCalledWith('AI 连接测试成功')
   })
 
   it('shows API errors through ElMessage', async () => {

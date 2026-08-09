@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Event, Thread
 
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
@@ -15,7 +16,7 @@ from app.config import get_settings
 from app.database import create_database_engine
 from app.enums import JobStatus, RowStatus
 from app.integrations.ai_provider import AIProviderError, OpenAICompatibleProvider
-from app.models import Base, Job, JobAttempt, PromptRow, PromptTemplate
+from app.models import Job, JobAttempt, PromptRow, PromptTemplate
 from app.services.ai_config import load_ai_configuration
 from app.services.results import finalize_result_with_row_cas
 
@@ -113,12 +114,50 @@ def load_skill_prompts(skill_root: Path | None = None) -> tuple[str, str]:
     return system_prompt, user_prompt
 
 
-def resolve_job_prompts(session: Session) -> tuple[str, str]:
+def _inject_snapshot_options(user_prompt: str, snapshot: dict[str, object]) -> str:
+    row_options = snapshot.get("row_options")
+    options = row_options if isinstance(row_options, dict) else {}
+    custom_requirements = options.get("custom_requirements")
+    requirements_text = (
+        custom_requirements.strip()
+        if isinstance(custom_requirements, str) and custom_requirements.strip()
+        else "无"
+    )
+    include_person = "是" if options.get("include_person") is True else "否"
+    view_override = options.get("view_override")
+    view_override_text = (
+        json.dumps(view_override, ensure_ascii=False, sort_keys=True)
+        if isinstance(view_override, dict) and view_override
+        else "无"
+    )
+    return (
+        f"{user_prompt}\n\n【本次任务不可变输入】\n"
+        f"【附加要求】{requirements_text}\n"
+        f"【包含人物】{include_person}\n"
+        f"【人工方位覆盖】{view_override_text}\n"
+        "以上输入来自 Job 快照，必须严格执行；人工方位覆盖的优先级高于模型判断，不得更改。"
+    )
+
+
+def resolve_job_prompts(
+    session: Session, snapshot: dict[str, object] | None = None
+) -> tuple[str, str]:
     """优先解析数据库中的活跃模板，无活跃模板时读取技能规则文件。"""
-    template = session.scalar(select(PromptTemplate).where(PromptTemplate.is_active.is_(True)))
-    if template is not None:
-        return template.system_prompt, template.user_prompt_template
-    return load_skill_prompts()
+    frozen_template = snapshot.get("template") if snapshot is not None else None
+    if isinstance(frozen_template, dict) and isinstance(
+        frozen_template.get("system_prompt"), str
+    ) and isinstance(frozen_template.get("user_prompt_template"), str):
+        system_prompt = frozen_template["system_prompt"]
+        user_prompt = frozen_template["user_prompt_template"]
+    else:
+        template = session.scalar(select(PromptTemplate).where(PromptTemplate.is_active.is_(True)))
+        if template is not None:
+            system_prompt, user_prompt = template.system_prompt, template.user_prompt_template
+        else:
+            system_prompt, user_prompt = load_skill_prompts()
+    if snapshot is not None:
+        user_prompt = _inject_snapshot_options(user_prompt, snapshot)
+    return system_prompt, user_prompt
 
 
 def run_prompt_job(
@@ -135,7 +174,6 @@ def run_prompt_job(
     db_path = url.replace("sqlite:///", "")
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     engine = create_database_engine(url)
-    Base.metadata.create_all(engine)
 
     settings = get_settings()
     with Session(engine) as session:
@@ -152,7 +190,7 @@ def run_prompt_job(
             )
         )
         session.commit()
-        if result.rowcount != 1:
+        if not isinstance(result, CursorResult) or result.rowcount != 1:
             return
         job = session.get(Job, job_id)
         if job is None:
@@ -176,18 +214,23 @@ def run_prompt_job(
         except ValueError:
             _fail_job(session, job, "AI_CONFIGURATION_INVALID", "视觉模型配置无法读取")
             return
-        base_url = ai_base_url or configuration.base_url
+        frozen_ai = snapshot.get("ai")
+        ai_snapshot = frozen_ai if isinstance(frozen_ai, dict) else {}
+        base_url = ai_base_url or ai_snapshot.get("base_url") or configuration.base_url
         api_key = ai_api_key or configuration.api_key
-        model = ai_model or configuration.model
-        if not base_url or not api_key or not model:
+        model = ai_model or ai_snapshot.get("model") or configuration.model
+        chat_path = ai_chat_path or ai_snapshot.get("chat_path") or configuration.chat_path
+        timeout_seconds = ai_snapshot.get("timeout_seconds", configuration.timeout_seconds)
+        if not isinstance(base_url, str) or not api_key or not isinstance(model, str):
             _fail_job(session, job, "AI_NOT_CONFIGURED", "视觉模型尚未配置")
             return
         provider = OpenAICompatibleProvider(
             base_url=base_url,
             api_key=api_key,
             model=model,
-            chat_path=ai_chat_path or configuration.chat_path,
-            timeout_seconds=configuration.timeout_seconds,
+            chat_path=str(chat_path),
+            timeout_seconds=float(timeout_seconds),
+            allow_private_networks=settings.ssrf_allow_private_networks,
         )
         attempt_no = session.query(JobAttempt).filter_by(job_id=job.id).count() + 1
         attempt = JobAttempt(
@@ -209,7 +252,7 @@ def run_prompt_job(
         heartbeat_thread.start()
 
         try:
-            system_prompt, user_prompt = resolve_job_prompts(session)
+            system_prompt, user_prompt = resolve_job_prompts(session, snapshot)
             provider_result = provider.generate_prompt(
                 scene_data_url=scene_url,
                 sofa_data_url=sofa_url,
@@ -282,35 +325,82 @@ def _recover_failed_attempt(
     if job is None:
         return
     if attempt is not None:
-        attempt.status = "FAILED"
-        attempt.error_code = code
-        attempt.error_message = message
+        canceled = job.cancel_requested or job.status == JobStatus.CANCEL_REQUESTED
+        attempt.status = "CANCELED" if canceled else "FAILED"
+        attempt.error_code = None if canceled else code
+        attempt.error_message = None if canceled else message
         attempt.duration_ms = int((time.monotonic() - started) * 1000)
         attempt.completed_at = datetime.now(UTC)
-    _fail_job(session, job, code, message)
+    if job.cancel_requested or job.status == JobStatus.CANCEL_REQUESTED:
+        _cancel_job(session, job)
+    else:
+        _fail_job(session, job, code, message)
 
 
 def _fail_job(session: Session, job: Job, code: str, message: str) -> None:
-    job.status = JobStatus.FAILED
-    job.error_code = code
-    job.error_message = message
-    job.completed_at = datetime.now(UTC)
-    row = session.get(PromptRow, job.row_id)
-    if row is not None and row.active_job_id == job.id:
-        row.active_job_id = None
-        row.status = RowStatus.FAILED
-        row.error_message = message
+    completed_at = datetime.now(UTC)
+    finalized = session.execute(
+        update(Job)
+        .where(
+            Job.id == job.id,
+            Job.status.in_(
+                (
+                    JobStatus.PENDING_DISPATCH,
+                    JobStatus.QUEUED,
+                    JobStatus.RUNNING,
+                    JobStatus.VALIDATING,
+                    JobStatus.REPAIRING,
+                )
+            ),
+        )
+        .values(
+            status=JobStatus.FAILED,
+            error_code=code,
+            error_message=message,
+            completed_at=completed_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if getattr(finalized, "rowcount", 0) == 1:
+        session.execute(
+            update(PromptRow)
+            .where(PromptRow.id == job.row_id, PromptRow.active_job_id == job.id)
+            .values(active_job_id=None, status=RowStatus.FAILED, error_message=message)
+            .execution_options(synchronize_session=False)
+        )
     session.commit()
 
 
 def _cancel_job(session: Session, job: Job) -> None:
-    job.status = JobStatus.CANCELED
-    job.completed_at = datetime.now(UTC)
-    row = session.get(PromptRow, job.row_id)
-    if row is not None and row.active_job_id == job.id:
-        row.active_job_id = None
-        if row.deleted_at is None:
-            row.status = RowStatus.CANCELED
+    finalized = session.execute(
+        update(Job)
+        .where(
+            Job.id == job.id,
+            Job.status.in_(
+                (
+                    JobStatus.PENDING_DISPATCH,
+                    JobStatus.QUEUED,
+                    JobStatus.RUNNING,
+                    JobStatus.VALIDATING,
+                    JobStatus.REPAIRING,
+                    JobStatus.CANCEL_REQUESTED,
+                )
+            ),
+        )
+        .values(status=JobStatus.CANCELED, completed_at=datetime.now(UTC))
+        .execution_options(synchronize_session=False)
+    )
+    if getattr(finalized, "rowcount", 0) == 1:
+        session.execute(
+            update(PromptRow)
+            .where(
+                PromptRow.id == job.row_id,
+                PromptRow.active_job_id == job.id,
+                PromptRow.deleted_at.is_(None),
+            )
+            .values(active_job_id=None, status=RowStatus.CANCELED)
+            .execution_options(synchronize_session=False)
+        )
     session.commit()
 
 
@@ -337,5 +427,3 @@ def reap_stale_jobs(session: Session, *, timeout_seconds: float = HEARTBEAT_TIME
         _fail_job(session, job, "HEARTBEAT_TIMEOUT", "Worker 心跳超时，任务已自动回收")
         reaped += 1
     return reaped
-
-

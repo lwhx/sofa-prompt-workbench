@@ -5,13 +5,13 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import urlsplit, urlunsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.models import AppSetting
+from app.security.outbound import validate_outbound_url
 
 _AI_CONFIGURATION_KEY = "ai_configuration"
 
@@ -34,19 +34,14 @@ class AIConfiguration:
         return bool(self.base_url and self.api_key and self.model)
 
 
-def normalize_base_url(value: str) -> str:
+def normalize_base_url(value: str, *, allow_private_networks: bool = False) -> str:
     """校验并规范化 OpenAI 兼容服务地址。"""
-    parsed = urlsplit(value.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("Base URL 必须是有效的 HTTP 或 HTTPS 地址")
-    if parsed.username or parsed.password:
-        raise ValueError("Base URL 不允许包含用户名或密码")
-    host = parsed.hostname
-    if ":" in host:
-        host = f"[{host}]"
-    netloc = f"{host}:{parsed.port}" if parsed.port else host
-    path = parsed.path.rstrip("/")
-    return urlunsplit((parsed.scheme, netloc, path, "", ""))
+    normalized = validate_outbound_url(
+        value,
+        allow_private_networks=allow_private_networks,
+        strip_query=True,
+    )
+    return normalized.rstrip("/")
 
 
 def normalize_chat_path(value: str) -> str:
@@ -67,7 +62,14 @@ def _environment_configuration(settings: Settings) -> AIConfiguration:
     """从环境变量构造回退配置。"""
     return AIConfiguration(
         provider="openai-compatible",
-        base_url=normalize_base_url(settings.ai_base_url) if settings.ai_base_url else None,
+        base_url=(
+            normalize_base_url(
+                settings.ai_base_url,
+                allow_private_networks=settings.ssrf_allow_private_networks,
+            )
+            if settings.ai_base_url
+            else None
+        ),
         api_key=settings.ai_api_key,
         model=settings.ai_model,
         chat_path=normalize_chat_path(settings.ai_chat_completions_path),
@@ -84,9 +86,22 @@ def load_ai_configuration(session: Session, settings: Settings) -> AIConfigurati
     try:
         plaintext = _fernet(settings).decrypt(setting.value_json.encode("utf-8"))
         payload = json.loads(plaintext)
+        if payload.get("disabled") is True:
+            return AIConfiguration(
+                provider="openai-compatible",
+                base_url=None,
+                api_key=None,
+                model=None,
+                chat_path="/chat/completions",
+                timeout_seconds=240,
+                source="database",
+            )
         return AIConfiguration(
             provider=str(payload["provider"]),
-            base_url=normalize_base_url(str(payload["base_url"])),
+            base_url=normalize_base_url(
+                str(payload["base_url"]),
+                allow_private_networks=settings.ssrf_allow_private_networks,
+            ),
             api_key=str(payload["api_key"]),
             model=str(payload["model"]),
             chat_path=normalize_chat_path(str(payload["chat_path"])),
@@ -112,7 +127,10 @@ def save_ai_configuration(
     resolved_api_key = api_key.strip() if api_key and api_key.strip() else current.api_key
     configuration = AIConfiguration(
         provider="openai-compatible",
-        base_url=normalize_base_url(base_url),
+        base_url=normalize_base_url(
+            base_url,
+            allow_private_networks=settings.ssrf_allow_private_networks,
+        ),
         api_key=resolved_api_key,
         model=model.strip(),
         chat_path=normalize_chat_path(chat_path),
@@ -141,6 +159,33 @@ def save_ai_configuration(
         setting.encrypted = True
         setting.updated_at = datetime.now(UTC)
     return configuration
+
+
+def delete_ai_configuration(session: Session, settings: Settings) -> AIConfiguration:
+    """保存禁用标记以清空数据库配置，并阻止继续回退环境变量。"""
+    payload = json.dumps(
+        {"disabled": True},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    encrypted_value = _fernet(settings).encrypt(payload.encode("utf-8")).decode("utf-8")
+    setting = session.get(AppSetting, _AI_CONFIGURATION_KEY)
+    if setting is None:
+        setting = AppSetting(key=_AI_CONFIGURATION_KEY, value_json=encrypted_value, encrypted=True)
+        session.add(setting)
+    else:
+        setting.value_json = encrypted_value
+        setting.encrypted = True
+        setting.updated_at = datetime.now(UTC)
+    return AIConfiguration(
+        provider="openai-compatible",
+        base_url=None,
+        api_key=None,
+        model=None,
+        chat_path="/chat/completions",
+        timeout_seconds=240,
+        source="database",
+    )
 
 
 def public_ai_configuration(configuration: AIConfiguration) -> dict[str, object]:
