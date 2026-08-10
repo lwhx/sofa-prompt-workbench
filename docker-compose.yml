@@ -1,12 +1,10 @@
 name: sofa-prompt-workbench
 
 x-backend: &backend
-  build:
-    context: .
-    dockerfile: backend/Dockerfile
+  image: ${BACKEND_IMAGE:-ghcr.io/lwhx/sofa-prompt-workbench-backend}:${IMAGE_TAG:-latest}
   env_file: .env
   environment:
-    TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.30.0.10/32}
+    TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.30.0.11/32}
   volumes:
     - ./data/db:/data/db
     - ./data/cache:/data/cache
@@ -74,9 +72,7 @@ services:
       migrate: { condition: service_completed_successfully }
 
   web:
-    build:
-      context: .
-      dockerfile: frontend/Dockerfile
+    image: ${WEB_IMAGE:-ghcr.io/lwhx/sofa-prompt-workbench-web}:${IMAGE_TAG:-latest}
     ports: ["8080:8080"]
     depends_on:
       api: { condition: service_healthy }

@@ -1,0 +1,25 @@
+services:
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+  dispatcher:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+  maintenance:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile

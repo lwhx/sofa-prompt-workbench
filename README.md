@@ -53,9 +53,16 @@ npm run build
 
 ## Docker 部署
 
+推送 `main` 分支或 `v*` 标签后，GitHub Actions 会为 `linux/amd64` 构建并发布以下 GHCR 镜像：
+
+- `ghcr.io/lwhx/sofa-prompt-workbench-backend`
+- `ghcr.io/lwhx/sofa-prompt-workbench-web`
+
+`main` 发布 `latest` 和 `sha-*` 标签，版本标签发布同名版本镜像。服务器部署步骤：
+
 1. 复制 `.env.example` 为 `.env`，填写强随机 Session Secret、OneImg 和 AI 凭据；
 2. 执行 `docker compose config` 检查；
-3. 执行 `docker compose build`；
+3. 执行 `docker compose pull` 拉取镜像；
 4. 执行 `docker compose run --rm migrate`；
 5. 通过交互式命令初始化管理员：
 
@@ -65,6 +72,15 @@ docker compose run --rm api python -m app.cli create-admin --username admin
 
 6. 执行 `docker compose up -d`；
 7. 访问 `http://localhost:8080/health/ready`。
+
+部署固定版本时设置 `IMAGE_TAG`，例如 `IMAGE_TAG=v1.2.0 docker compose up -d`。如 GHCR 包为私有包，服务器需先使用具有 `read:packages` 权限的令牌执行 `docker login ghcr.io`。
+
+本地源码构建使用叠加配置：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml build
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+```
 
 管理员初始化命令不会回显密码，密码至少需要 12 个字符；同名管理员已存在时命令会安全退出，不会覆盖现有密码。
 
